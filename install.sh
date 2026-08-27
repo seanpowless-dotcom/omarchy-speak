@@ -19,5 +19,5 @@ systemctl --user daemon-reload
 echo "service installed. enable with:"
 echo "  systemctl --user enable --now omarchy-speak"
 echo
-echo "then add to ~/.config/hypr/hyprland.conf:"
-echo "  source = $SRC/hypr/speak.conf"
+echo "then add the keybindings from $SRC/hypr/speak.lua"
+echo "to ~/.config/hypr/bindings.lua"
