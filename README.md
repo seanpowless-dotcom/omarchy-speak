@@ -105,7 +105,7 @@ The daemon itself is Python stdlib only — no pip install, no virtualenv.
 From source, into `~/.local/bin`:
 
 ```bash
-git clone https://github.com/YOURNAME/omarchy-speak
+git clone https://github.com/seanpowless-dotcom/omarchy-speak
 cd omarchy-speak
 ./install.sh
 systemctl --user enable --now omarchy-speak

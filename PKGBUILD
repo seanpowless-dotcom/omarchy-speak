@@ -1,10 +1,10 @@
-# Maintainer: YOUR NAME <you@example.com>
+# Maintainer: Sean Powless <249371201+seanpowless-dotcom@users.noreply.github.com>
 pkgname=omarchy-speak
 pkgver=0.1.0
 pkgrel=1
 pkgdesc="System-wide text-to-speech for Omarchy, driven by Hyprland keybinds"
 arch=('any')
-url="https://github.com/YOURNAME/omarchy-speak"
+url="https://github.com/seanpowless-dotcom/omarchy-speak"
 license=('MIT')
 depends=(
   'python'          # daemon and wrappers; stdlib only

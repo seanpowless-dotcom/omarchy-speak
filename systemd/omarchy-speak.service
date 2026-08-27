@@ -1,6 +1,6 @@
 [Unit]
 Description=omarchy-speak TTS daemon
-Documentation=https://github.com/YOURNAME/omarchy-speak
+Documentation=https://github.com/seanpowless-dotcom/omarchy-speak
 After=graphical-session.target
 PartOf=graphical-session.target
 
