@@ -1,0 +1,352 @@
+#!/usr/bin/env python3
+"""omarchy-speak — a small local TTS daemon for Omarchy.
+
+Speaks the primary selection, the clipboard, or arbitrary text through a
+configurable engine (piper for speed, kokoro for quality). Exposes a tiny
+HTTP API on loopback so any client — Hyprland keybinds, a status-bar widget,
+a browser extension — can drive the same backend.
+
+Stdlib only. No runtime dependencies beyond the TTS engines themselves.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+CONFIG_PATH = Path(
+    os.environ.get("OMARCHY_SPEAK_CONFIG", "~/.config/omarchy-speak/config.json")
+).expanduser()
+
+DEFAULT_CONFIG = {
+    "host": "127.0.0.1",
+    "port": 8765,
+    "default_engine": "piper",
+    "save_dir": "~/Audio/speak",
+    "max_chars": 20000,
+    "engines": {
+        # mode "stream": engine writes raw audio to stdout, piped straight to
+        # the player. Lowest latency — speech starts before synthesis ends.
+        "piper": {
+            "mode": "stream",
+            "speak": ["piper", "--model", "{model}", "--output-raw"],
+            "save": ["piper", "--model", "{model}", "--output_file", "{out}"],
+            "play": ["aplay", "-q", "-r", "22050", "-f", "S16_LE", "-t", "raw", "-"],
+            "model": "",
+        },
+        # mode "file": engine renders a wav, then we play it. Higher latency,
+        # but works with engines that have no streaming path.
+        "kokoro": {
+            "mode": "file",
+            "save": ["kokoro-tts", "-", "{out}", "--voice", "{voice}"],
+            "play": ["paplay", "{out}"],
+            "voice": "af_sky",
+        },
+    },
+}
+
+
+def load_config() -> dict:
+    cfg = json.loads(json.dumps(DEFAULT_CONFIG))  # deep copy
+    if CONFIG_PATH.exists():
+        user = json.loads(CONFIG_PATH.read_text())
+        for key, val in user.items():
+            if key == "engines" and isinstance(val, dict):
+                for name, spec in val.items():
+                    cfg["engines"].setdefault(name, {}).update(spec)
+            else:
+                cfg[key] = val
+    return cfg
+
+
+def write_default_config() -> Path:
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_PATH.write_text(json.dumps(DEFAULT_CONFIG, indent=2) + "\n")
+    return CONFIG_PATH
+
+
+def read_selection(primary: bool) -> str:
+    """Read the Wayland primary selection or clipboard."""
+    cmd = ["wl-paste", "--no-newline"]
+    if primary:
+        cmd.append("--primary")
+    try:
+        out = subprocess.run(cmd, capture_output=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"wl-paste failed: {exc}") from exc
+    return out.stdout.decode("utf-8", "replace").strip()
+
+
+def render(template: list[str], **fields) -> list[str]:
+    return [part.format(**fields) for part in template]
+
+
+class Player:
+    """Single-flight audio playback. Starting a new utterance stops the old one."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._procs: list[subprocess.Popen] = []
+        self._engine: str | None = None
+        self._started: float = 0.0
+
+    @property
+    def busy(self) -> bool:
+        with self._lock:
+            return any(p.poll() is None for p in self._procs)
+
+    def status(self) -> dict:
+        with self._lock:
+            speaking = any(p.poll() is None for p in self._procs)
+            return {
+                "speaking": speaking,
+                "engine": self._engine if speaking else None,
+                "elapsed": round(time.time() - self._started, 2) if speaking else 0,
+            }
+
+    def stop(self) -> bool:
+        """Terminate the current chain. Returns True if something was playing."""
+        with self._lock:
+            was_running = any(p.poll() is None for p in self._procs)
+            for proc in reversed(self._procs):
+                if proc.poll() is None:
+                    proc.terminate()
+            deadline = time.time() + 2
+            for proc in self._procs:
+                remaining = max(0, deadline - time.time())
+                try:
+                    proc.wait(timeout=remaining)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+            self._procs = []
+            self._engine = None
+            return was_running
+
+    def speak(self, text: str, engine: str, spec: dict) -> None:
+        self.stop()
+        mode = spec.get("mode", "stream")
+        if mode == "stream":
+            procs = self._spawn_stream(text, spec)
+        else:
+            procs = self._spawn_file(text, spec)
+        with self._lock:
+            self._procs = procs
+            self._engine = engine
+            self._started = time.time()
+
+    def _spawn_stream(self, text: str, spec: dict) -> list[subprocess.Popen]:
+        tts_cmd = render(spec["speak"], **spec)
+        play_cmd = render(spec["play"], **spec)
+        tts = subprocess.Popen(
+            tts_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        play = subprocess.Popen(
+            play_cmd, stdin=tts.stdout, stderr=subprocess.DEVNULL,
+        )
+        tts.stdout.close()  # let the player own the read end
+
+        def feed() -> None:
+            try:
+                tts.stdin.write(text.encode())
+                tts.stdin.close()
+            except (BrokenPipeError, ValueError):
+                pass
+
+        threading.Thread(target=feed, daemon=True).start()
+        return [tts, play]
+
+    def _spawn_file(self, text: str, spec: dict) -> list[subprocess.Popen]:
+        tmp = Path(f"/tmp/omarchy-speak-{os.getpid()}-{int(time.time()*1000)}.wav")
+        synth = subprocess.run(
+            render(spec["save"], out=str(tmp), **spec),
+            input=text.encode(), capture_output=True,
+        )
+        if synth.returncode != 0 or not tmp.exists():
+            err = synth.stderr.decode("utf-8", "replace")[:400]
+            raise RuntimeError(f"synthesis failed: {err or 'no output produced'}")
+        play = subprocess.Popen(
+            render(spec["play"], out=str(tmp), **spec), stderr=subprocess.DEVNULL,
+        )
+
+        def cleanup() -> None:
+            play.wait()
+            tmp.unlink(missing_ok=True)
+
+        threading.Thread(target=cleanup, daemon=True).start()
+        return [play]
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "omarchy-speak"
+    protocol_version = "HTTP/1.1"
+
+    # -- plumbing ---------------------------------------------------------
+    def log_message(self, fmt, *args):  # quieter than the stdlib default
+        if self.server.verbose:
+            sys.stderr.write(f"{self.address_string()} {fmt % args}\n")
+
+    def _send(self, code: int, payload: dict) -> None:
+        body = json.dumps(payload).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _body(self) -> dict:
+        length = int(self.headers.get("Content-Length") or 0)
+        if not length:
+            return {}
+        try:
+            return json.loads(self.rfile.read(length))
+        except json.JSONDecodeError:
+            return {}
+
+    # -- routes -----------------------------------------------------------
+    def do_GET(self):
+        if self.path in ("/health", "/status"):
+            self._send(200, {"ok": True, **self.server.player.status()})
+        elif self.path == "/engines":
+            cfg = self.server.config
+            self._send(200, {
+                "default": cfg["default_engine"],
+                "engines": sorted(cfg["engines"]),
+            })
+        else:
+            self._send(404, {"error": "not found"})
+
+    def do_POST(self):
+        routes = {
+            "/speak": self._speak,
+            "/speak/selection": lambda b: self._speak(b, source="primary"),
+            "/speak/clipboard": lambda b: self._speak(b, source="clipboard"),
+            "/save": self._save,
+            "/stop": self._stop,
+            "/toggle": self._toggle,
+        }
+        handler = routes.get(self.path)
+        if not handler:
+            self._send(404, {"error": "not found"})
+            return
+        try:
+            handler(self._body())
+        except RuntimeError as exc:
+            self._send(400, {"error": str(exc)})
+        except Exception as exc:  # noqa: BLE001 - surface it, don't crash the daemon
+            self._send(500, {"error": f"{type(exc).__name__}: {exc}"})
+
+    # -- actions ----------------------------------------------------------
+    def _resolve(self, body: dict, source: str | None) -> tuple[str, str, dict]:
+        cfg = self.server.config
+        if source:
+            text = read_selection(primary=(source == "primary"))
+        else:
+            text = (body.get("text") or "").strip()
+        if not text:
+            raise RuntimeError(f"nothing to speak ({source or 'text'} was empty)")
+        text = text[: cfg["max_chars"]]
+
+        engine = body.get("engine") or cfg["default_engine"]
+        spec = cfg["engines"].get(engine)
+        if spec is None:
+            raise RuntimeError(f"unknown engine {engine!r}")
+        missing = self._missing_binaries(spec)
+        if missing:
+            raise RuntimeError(f"{engine}: missing binaries: {', '.join(missing)}")
+        return text, engine, spec
+
+    @staticmethod
+    def _missing_binaries(spec: dict) -> list[str]:
+        missing = []
+        for key in ("speak", "save", "play"):
+            cmd = spec.get(key)
+            if cmd and shutil.which(cmd[0]) is None:
+                missing.append(cmd[0])
+        return sorted(set(missing))
+
+    def _speak(self, body: dict, source: str | None = None) -> None:
+        text, engine, spec = self._resolve(body, source)
+        self.server.player.speak(text, engine, spec)
+        self._send(200, {"ok": True, "engine": engine, "chars": len(text)})
+
+    def _save(self, body: dict) -> None:
+        cfg = self.server.config
+        text, engine, spec = self._resolve(body, body.get("source"))
+        if "save" not in spec:
+            raise RuntimeError(f"engine {engine!r} has no save command")
+
+        dest = body.get("path")
+        if dest:
+            out = Path(dest).expanduser()
+        else:
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            out = Path(cfg["save_dir"]).expanduser() / f"speak-{stamp}.wav"
+        out.parent.mkdir(parents=True, exist_ok=True)
+
+        result = subprocess.run(
+            render(spec["save"], out=str(out), **spec),
+            input=text.encode(), capture_output=True,
+        )
+        if result.returncode != 0 or not out.exists():
+            err = result.stderr.decode("utf-8", "replace")[:400]
+            raise RuntimeError(f"save failed: {err or 'no output produced'}")
+        self._send(200, {"ok": True, "engine": engine, "path": str(out),
+                         "bytes": out.stat().st_size})
+
+    def _stop(self, body: dict) -> None:
+        self._send(200, {"ok": True, "stopped": self.server.player.stop()})
+
+    def _toggle(self, body: dict) -> None:
+        """Stop if speaking, otherwise speak the primary selection."""
+        if self.server.player.stop():
+            self._send(200, {"ok": True, "action": "stopped"})
+            return
+        text, engine, spec = self._resolve(body, "primary")
+        self.server.player.speak(text, engine, spec)
+        self._send(200, {"ok": True, "action": "speaking", "engine": engine})
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    if "--init-config" in args:
+        print(f"wrote {write_default_config()}")
+        return 0
+    if "--help" in args or "-h" in args:
+        print(__doc__)
+        print("usage: omarchy-speak [--init-config] [--verbose]")
+        print(f"config: {CONFIG_PATH}")
+        return 0
+
+    cfg = load_config()
+    server = ThreadingHTTPServer((cfg["host"], cfg["port"]), Handler)
+    server.daemon_threads = True
+    server.config = cfg
+    server.player = Player()
+    server.verbose = "--verbose" in args or "-v" in args
+
+    def shutdown(signum, frame):
+        server.player.stop()
+        threading.Thread(target=server.shutdown, daemon=True).start()
+
+    signal.signal(signal.SIGINT, shutdown)
+    signal.signal(signal.SIGTERM, shutdown)
+
+    print(f"omarchy-speak on http://{cfg['host']}:{cfg['port']} "
+          f"(engine: {cfg['default_engine']})", flush=True)
+    server.serve_forever()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

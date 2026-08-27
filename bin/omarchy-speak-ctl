@@ -1,0 +1,100 @@
+#!/bin/bash
+# omarchy-speak-ctl — thin client for the omarchy-speak daemon.
+# Designed to be bound to Hyprland keys. Reports via notifications.
+
+set -uo pipefail
+
+HOST="${OMARCHY_SPEAK_HOST:-127.0.0.1}"
+PORT="${OMARCHY_SPEAK_PORT:-8765}"
+BASE="http://$HOST:$PORT"
+
+notify() {
+  command -v notify-send >/dev/null && notify-send -a "omarchy-speak" -t 2500 "$@" || echo "$*"
+}
+
+# POST to the daemon; on success echo the body, on failure notify and exit 1.
+post() {
+  local path="$1" body="${2:-{\}}" response code
+  response=$(curl -sS -m 300 -w '\n%{http_code}' \
+    -H 'Content-Type: application/json' -d "$body" "$BASE$path" 2>&1) || {
+    notify "Speak: daemon not reachable" "Is omarchy-speak running?"
+    exit 1
+  }
+  code=$(tail -n1 <<<"$response")
+  body=$(sed '$d' <<<"$response")
+  if [[ "$code" != 200 ]]; then
+    notify "Speak: error" "$(python3 -c 'import json,sys;print(json.load(sys.stdin).get("error","?"))' <<<"$body" 2>/dev/null || echo "$body")"
+    exit 1
+  fi
+  echo "$body"
+}
+
+# Build a JSON body from optional engine / path arguments.
+json_body() {
+  local engine="${1:-}" path="${2:-}"
+  python3 -c '
+import json, sys
+engine, path = sys.argv[1], sys.argv[2]
+body = {}
+if engine: body["engine"] = engine
+if path:   body["path"] = path
+print(json.dumps(body))
+' "$engine" "$path"
+}
+
+usage() {
+  cat <<'USAGE'
+omarchy-speak-ctl <command> [engine] [path]
+
+  selection [engine]     speak the highlighted text (primary selection)
+  clipboard [engine]     speak the clipboard
+  say <text> [engine]    speak literal text
+  toggle [engine]        stop if speaking, else speak the selection
+  stop                   stop playback
+  save [engine] [path]   render the selection to a file
+  status                 report daemon state
+
+Engines come from the daemon config; omit to use the default.
+USAGE
+}
+
+cmd="${1:-}"
+case "$cmd" in
+  selection) post /speak/selection "$(json_body "${2:-}")" >/dev/null ;;
+  clipboard) post /speak/clipboard "$(json_body "${2:-}")" >/dev/null ;;
+  toggle)
+    out=$(post /toggle "$(json_body "${2:-}")")
+    [[ "$out" == *stopped* ]] && notify "Speak: stopped"
+    ;;
+  stop)
+    out=$(post /stop)
+    [[ "$out" == *'"stopped": true'* ]] && notify "Speak: stopped"
+    ;;
+  say)
+    [[ -z "${2:-}" ]] && { usage; exit 1; }
+    body=$(python3 -c '
+import json, sys
+body = {"text": sys.argv[1]}
+if len(sys.argv) > 2 and sys.argv[2]: body["engine"] = sys.argv[2]
+print(json.dumps(body))
+' "$2" "${3:-}")
+    post /speak "$body" >/dev/null
+    ;;
+  save)
+    body=$(python3 -c '
+import json, sys
+body = {"source": "primary"}
+if sys.argv[1]: body["engine"] = sys.argv[1]
+if sys.argv[2]: body["path"] = sys.argv[2]
+print(json.dumps(body))
+' "${2:-}" "${3:-}")
+    out=$(post /save "$body")
+    notify "Speak: saved" "$(python3 -c 'import json,sys;print(json.load(sys.stdin)["path"])' <<<"$out")"
+    ;;
+  status)
+    curl -sS -m 5 "$BASE/status" | python3 -m json.tool 2>/dev/null \
+      || { notify "Speak: daemon not running"; exit 1; }
+    ;;
+  ""|-h|--help) usage ;;
+  *) usage; exit 1 ;;
+esac

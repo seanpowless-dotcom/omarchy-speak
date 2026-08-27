@@ -1,0 +1,16 @@
+[Unit]
+Description=omarchy-speak TTS daemon
+Documentation=https://github.com/YOURNAME/omarchy-speak
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/omarchy-speak
+Restart=on-failure
+RestartSec=2
+# The daemon shells out to wl-paste, so it needs the compositor's environment.
+# `systemctl --user import-environment` at login covers WAYLAND_DISPLAY.
+
+[Install]
+WantedBy=graphical-session.target
