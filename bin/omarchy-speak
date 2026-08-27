@@ -40,7 +40,7 @@ DEFAULT_CONFIG = {
         "piper": {
             "mode": "stream",
             "speak": ["piper", "--model", "{model}", "--output-raw"],
-            "save": ["piper", "--model", "{model}", "--output_file", "{out}"],
+            "save": ["piper", "--model", "{model}", "--output-file", "{out}"],
             "play": ["aplay", "-q", "-r", "22050", "-f", "S16_LE", "-t", "raw", "-"],
             "model": "",
         },
@@ -88,7 +88,18 @@ def read_selection(primary: bool) -> str:
 
 
 def render(template: list[str], **fields) -> list[str]:
-    return [part.format(**fields) for part in template]
+    """Substitute {placeholders} and expand a leading ~ in the result.
+
+    Config files carry paths like ~/.local/share/piper/voices/x.onnx; the
+    engine subprocess gets no shell, so the tilde must be expanded here.
+    """
+    parts = []
+    for part in template:
+        value = part.format(**fields)
+        if value.startswith("~"):
+            value = str(Path(value).expanduser())
+        parts.append(value)
+    return parts
 
 
 class Player:

@@ -24,6 +24,19 @@ covers every application at once.
 - At least one TTS engine: [piper](https://github.com/OHF-Voice/piper1-gpl),
   [kokoro](https://huggingface.co/hexgrad/Kokoro-82M)
 
+Installing piper and a voice:
+
+```bash
+uv tool install piper-tts
+uv tool run --from piper-tts python -m piper.download_voices \
+  en_US-lessac-medium --download-dir ~/.local/share/piper/voices
+```
+
+Then point `engines.piper.model` at the `.onnx` file, and set the `-r` value in
+`engines.piper.play` to the voice's sample rate (read it from the sidecar
+`.onnx.json` under `audio.sample_rate`). `config.example.json` is a working
+piper setup you can copy.
+
 The daemon itself is Python stdlib only — no pip install, no virtualenv.
 
 ## Install
