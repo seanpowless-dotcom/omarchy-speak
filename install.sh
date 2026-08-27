@@ -15,6 +15,14 @@ echo "installed → $BIN/omarchy-speak{,-ctl}"
 
 install -Dm644 "$SRC/systemd/omarchy-speak.service" \
   "$HOME/.config/systemd/user/omarchy-speak.service"
+
+# Optional: warm kokoro worker. Only useful once kokoro is installed.
+if [[ -x "$BIN/omarchy-speak-kokoro" ]]; then
+  install -Dm644 "$SRC/systemd/omarchy-speak-kokoro.service" \
+    "$HOME/.config/systemd/user/omarchy-speak-kokoro.service"
+  echo "kokoro worker unit installed (enable to skip the model load per utterance)"
+fi
+
 systemctl --user daemon-reload
 echo "service installed. enable with:"
 echo "  systemctl --user enable --now omarchy-speak"

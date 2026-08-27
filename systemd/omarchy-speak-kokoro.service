@@ -1,0 +1,21 @@
+[Unit]
+Description=omarchy-speak kokoro warm worker
+Documentation=https://github.com/YOURNAME/omarchy-speak
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/omarchy-speak-kokoro --serve
+Restart=on-failure
+RestartSec=2
+# Holds the 311MB model resident so utterances skip the load. Without this
+# unit the CLI still works -- it just loads the model per invocation.
+#
+# Steady state is ~700MB: the model plus onnxruntime's arena allocator, which
+# grows for the first few utterances and then plateaus. The ceiling below is a
+# runaway guard, not a working limit.
+MemoryMax=2G
+
+[Install]
+WantedBy=graphical-session.target

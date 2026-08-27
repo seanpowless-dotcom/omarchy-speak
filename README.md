@@ -57,10 +57,35 @@ install -Dm755 bin/omarchy-speak-kokoro ~/.local/bin/omarchy-speak-kokoro
 engines are configured the same way. Its shebang must point at the venv python
 above. `--list-voices` prints the 50-odd available voices.
 
-Kokoro synthesises faster than realtime on a modern CPU once loaded, but pays a
-fixed ~2s to load the 311MB model on each invocation. Streaming hides most of
-this on longer passages — audio starts at the first sentence — but short phrases
-will always feel slower to start than piper. That is the trade you are making.
+### The warm worker
+
+Loading kokoro's 311MB model costs ~1.9s, and paying it on every utterance is
+the difference between kokoro feeling usable and feeling broken. Run a warm
+worker that holds the model on a unix socket:
+
+```bash
+systemctl --user enable --now omarchy-speak-kokoro
+```
+
+The CLI finds the socket and uses it automatically. With no worker running it
+loads the model in-process exactly as before, so the worker is an optimisation
+and never a requirement — and output is byte-identical either way.
+
+Measured here, on a 2.07s utterance:
+
+| | to first audio | realtime factor |
+| --- | --- | --- |
+| Without worker | 3.42s | 0.6x |
+| With worker | **1.55s** | **1.3x** |
+
+The cost is ~700MB resident: the model plus onnxruntime's arena allocator,
+which grows over the first few utterances and then plateaus. The unit sets
+`MemoryMax=2G` as a runaway guard.
+
+Interrupting a long passage closes the client socket, which surfaces to the
+worker as a broken pipe and abandons that utterance — the model does not
+finish synthesising audio nobody will hear, and the next request is served
+immediately.
 
 The daemon itself is Python stdlib only — no pip install, no virtualenv.
 
