@@ -16,6 +16,7 @@ covers every application at once.
 - **Save to file** — render the selection to a wav in a configurable location
 - **Interrupt** — a second press stops playback; a new utterance replaces the old one
 - **Two engines** — fast by default, high-quality on a modifier
+- **Streaming** — both engines start speaking before synthesis finishes
 
 ## Requirements
 
@@ -36,6 +37,30 @@ Then point `engines.piper.model` at the `.onnx` file, and set the `-r` value in
 `engines.piper.play` to the voice's sample rate (read it from the sidecar
 `.onnx.json` under `audio.sample_rate`). `config.example.json` is a working
 piper setup you can copy.
+
+Installing kokoro (ONNX build — CPU only, no torch):
+
+```bash
+uv venv --python 3.12 ~/.local/share/omarchy-speak/venv
+uv pip install --python ~/.local/share/omarchy-speak/venv/bin/python \
+  kokoro-onnx soundfile
+
+M=~/.local/share/omarchy-speak/models; mkdir -p "$M"
+BASE=https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0
+curl -L -o "$M/kokoro-v1.0.onnx" "$BASE/kokoro-v1.0.onnx"   # 311 MB
+curl -L -o "$M/voices-v1.0.bin"  "$BASE/voices-v1.0.bin"    # 27 MB
+
+install -Dm755 bin/omarchy-speak-kokoro ~/.local/bin/omarchy-speak-kokoro
+```
+
+`bin/omarchy-speak-kokoro` wraps the library in a piper-shaped CLI, so both
+engines are configured the same way. Its shebang must point at the venv python
+above. `--list-voices` prints the 50-odd available voices.
+
+Kokoro synthesises faster than realtime on a modern CPU once loaded, but pays a
+fixed ~2s to load the 311MB model on each invocation. Streaming hides most of
+this on longer passages — audio starts at the first sentence — but short phrases
+will always feel slower to start than piper. That is the trade you are making.
 
 The daemon itself is Python stdlib only — no pip install, no virtualenv.
 
@@ -62,7 +87,11 @@ source = ~/projects/omarchy-speak/hypr/speak.conf
 | `SUPER + SHIFT + R` | Speak selection with kokoro |
 | `SUPER + ALT + R` | Speak clipboard |
 | `SUPER + SHIFT + ESC` | Stop |
-| `SUPER + SHIFT + S` | Save selection to audio |
+
+Keys were checked against `omarchy menu keybindings --print` before choosing;
+`SUPER+SHIFT+S` and the `SUPER+CTRL+R` family are Omarchy defaults, so the
+whole feature lives on `R` with modifiers.
+| `SUPER + SHIFT + ALT + R` | Save selection to audio |
 
 ## Configuration
 

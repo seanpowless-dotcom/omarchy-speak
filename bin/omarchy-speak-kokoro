@@ -1,0 +1,96 @@
+#!/home/powpow/.local/share/omarchy-speak/venv/bin/python
+"""Thin CLI over kokoro-onnx, shaped like piper's so both engines configure alike.
+
+Reads text on stdin. Streams raw int16 PCM to stdout with --output-raw, or
+writes a wav with --output-file. Streaming emits audio per sentence, so
+playback starts long before a long passage finishes synthesising -- which is
+what makes kokoro tolerable on a CPU.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import os
+import sys
+from pathlib import Path
+
+DATA = Path(os.environ.get(
+    "OMARCHY_SPEAK_KOKORO_DIR", "~/.local/share/omarchy-speak/models"
+)).expanduser()
+
+SAMPLE_RATE = 24000  # kokoro's native rate; keep the player's -r in step
+
+
+def build(args) -> "Kokoro":  # noqa: F821
+    from kokoro_onnx import Kokoro
+
+    model, voices = DATA / args.model, DATA / args.voices
+    for path in (model, voices):
+        if not path.exists():
+            sys.exit(f"kokoro: missing {path}\n"
+                     f"download the model files into {DATA}")
+    return Kokoro(str(model), str(voices))
+
+
+def to_pcm16(samples) -> bytes:
+    import numpy as np
+
+    clipped = np.clip(samples, -1.0, 1.0)
+    return (clipped * 32767).astype("<i2").tobytes()
+
+
+async def stream_raw(kokoro, text: str, args) -> None:
+    out = sys.stdout.buffer
+    stream = kokoro.create_stream(
+        text, voice=args.voice, speed=args.speed, lang=args.lang
+    )
+    async for samples, _rate in stream:
+        try:
+            out.write(to_pcm16(samples))
+            out.flush()
+        except BrokenPipeError:
+            return  # player exited (interrupted) -- stop cleanly
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="omarchy-speak-kokoro")
+    ap.add_argument("-v", "--voice", default="af_sarah")
+    ap.add_argument("-s", "--speed", type=float, default=1.0)
+    ap.add_argument("-l", "--lang", default="en-us")
+    ap.add_argument("-f", "--output-file", "--output_file", dest="output_file")
+    ap.add_argument("--output-raw", "--output_raw", action="store_true",
+                    dest="output_raw")
+    ap.add_argument("--model", default="kokoro-v1.0.onnx")
+    ap.add_argument("--voices", default="voices-v1.0.bin")
+    ap.add_argument("--list-voices", action="store_true")
+    args = ap.parse_args()
+
+    if args.list_voices:
+        print("\n".join(sorted(build(args).get_voices())))
+        return 0
+
+    text = sys.stdin.read().strip()
+    if not text:
+        sys.exit("kokoro: no text on stdin")
+
+    kokoro = build(args)
+
+    if args.output_raw:
+        asyncio.run(stream_raw(kokoro, text, args))
+        return 0
+
+    if not args.output_file:
+        sys.exit("kokoro: need --output-file or --output-raw")
+
+    import soundfile as sf
+
+    samples, rate = kokoro.create(
+        text, voice=args.voice, speed=args.speed, lang=args.lang
+    )
+    sf.write(args.output_file, samples, rate)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

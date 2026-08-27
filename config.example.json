@@ -34,18 +34,31 @@
       ]
     },
     "kokoro": {
-      "mode": "file",
-      "voice": "af_sky",
-      "save": [
-        "kokoro-tts",
-        "-",
-        "{out}",
+      "mode": "stream",
+      "voice": "af_sarah",
+      "speak": [
+        "omarchy-speak-kokoro",
         "--voice",
-        "{voice}"
+        "{voice}",
+        "--output-raw"
+      ],
+      "save": [
+        "omarchy-speak-kokoro",
+        "--voice",
+        "{voice}",
+        "--output-file",
+        "{out}"
       ],
       "play": [
-        "paplay",
-        "{out}"
+        "aplay",
+        "-q",
+        "-r",
+        "24000",
+        "-f",
+        "S16_LE",
+        "-t",
+        "raw",
+        "-"
       ]
     }
   }

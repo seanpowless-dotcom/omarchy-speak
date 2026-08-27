@@ -47,10 +47,11 @@ DEFAULT_CONFIG = {
         # mode "file": engine renders a wav, then we play it. Higher latency,
         # but works with engines that have no streaming path.
         "kokoro": {
-            "mode": "file",
-            "save": ["kokoro-tts", "-", "{out}", "--voice", "{voice}"],
-            "play": ["paplay", "{out}"],
-            "voice": "af_sky",
+            "mode": "stream",
+            "voice": "af_sarah",
+            "speak": ["omarchy-speak-kokoro", "--voice", "{voice}", "--output-raw"],
+            "save": ["omarchy-speak-kokoro", "--voice", "{voice}", "--output-file", "{out}"],
+            "play": ["aplay", "-q", "-r", "24000", "-f", "S16_LE", "-t", "raw", "-"],
         },
     },
 }
