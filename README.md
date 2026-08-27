@@ -128,11 +128,27 @@ Neither TTS engine is in the Arch repos; both come from PyPI (below). The
 daemon starts fine without them and reports which binaries are missing when
 asked to speak.
 
-Then source the keybinds from `~/.config/hypr/hyprland.conf`:
+Then add the keybindings. Omarchy configures Hyprland in Lua, so copy the
+`o.bind(...)` lines from `hypr/speak.lua` into `~/.config/hypr/bindings.lua`
+(a packaged install puts the file at `/usr/share/omarchy-speak/speak.lua`):
+
+```lua
+o.bind("SUPER + R", "Speak selection", "omarchy-speak-ctl toggle")
+o.bind("SUPER + SHIFT + R", "Speak selection (kokoro)", "omarchy-speak-ctl selection kokoro")
+o.bind("SUPER + ALT + R", "Speak clipboard", "omarchy-speak-ctl clipboard")
+o.bind("SUPER + SHIFT + ALT + R", "Save selection as audio", "omarchy-speak-ctl save kokoro")
+o.bind("SUPER + SHIFT + ESCAPE", "Stop speaking", "omarchy-speak-ctl stop")
+```
+
+Then `hyprctl reload`. On plain Hyprland without Omarchy's Lua layer, the
+equivalent `bindd =` lines go in `hyprland.conf`:
 
 ```
-source = ~/projects/omarchy-speak/hypr/speak.conf
+bindd = SUPER, R, Speak selection, exec, omarchy-speak-ctl toggle
 ```
+
+Check for conflicts before committing to keys — on Omarchy,
+`omarchy menu keybindings --print` lists what is already bound.
 
 ## Keybinds
 
