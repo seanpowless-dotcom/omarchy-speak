@@ -6,7 +6,10 @@ PartOf=graphical-session.target
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/omarchy-speak-kokoro --serve
+# Resolve the binary at start so one unit serves both a ~/.local
+# install and a packaged /usr/bin one.
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin
+ExecStart=/usr/bin/env sh -c 'exec "$(command -v omarchy-speak-kokoro)" --serve'
 Restart=on-failure
 RestartSec=2
 # Holds the 311MB model resident so utterances skip the load. Without this

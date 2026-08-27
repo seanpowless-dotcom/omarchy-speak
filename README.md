@@ -55,8 +55,18 @@ install -Dm755 bin/omarchy-speak-kokoro ~/.local/bin/omarchy-speak-kokoro
 ```
 
 `bin/omarchy-speak-kokoro` wraps the library in a piper-shaped CLI, so both
-engines are configured the same way. Its shebang must point at the venv python
-above. `--list-voices` prints the 50-odd available voices.
+engines are configured the same way. `--list-voices` prints the 50-odd
+available voices.
+
+The wrapper ships with a portable `#!/usr/bin/env python3` shebang. `install.sh`
+retargets it at the venv above when it finds one; if you installed the package
+instead, either make `kokoro-onnx` importable from the system python or point
+the config at the venv directly:
+
+```json
+"speak": ["~/.local/share/omarchy-speak/venv/bin/python",
+          "/usr/bin/omarchy-speak-kokoro", "--voice", "{voice}", "--output-raw"]
+```
 
 ### The warm worker
 
@@ -92,12 +102,31 @@ The daemon itself is Python stdlib only — no pip install, no virtualenv.
 
 ## Install
 
+From source, into `~/.local/bin`:
+
 ```bash
 git clone https://github.com/YOURNAME/omarchy-speak
 cd omarchy-speak
 ./install.sh
 systemctl --user enable --now omarchy-speak
 ```
+
+Or build the Arch package:
+
+```bash
+makepkg -si
+systemctl --user enable --now omarchy-speak
+cp /usr/share/omarchy-speak/config.example.json ~/.config/omarchy-speak/config.json
+```
+
+The units are **user** units, not system ones — the daemon needs your Wayland
+session to reach `wl-paste` and the audio server. Both install methods put
+`omarchy-speak` on your `PATH` and the units resolve it there, so a packaged
+install and a `~/.local/bin` one use the same unit files.
+
+Neither TTS engine is in the Arch repos; both come from PyPI (below). The
+daemon starts fine without them and reports which binaries are missing when
+asked to speak.
 
 Then source the keybinds from `~/.config/hypr/hyprland.conf`:
 

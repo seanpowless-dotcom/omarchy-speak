@@ -1,4 +1,4 @@
-#!/home/powpow/.local/share/omarchy-speak/venv/bin/python
+#!/usr/bin/env python3
 """Thin CLI over kokoro-onnx, shaped like piper's so both engines configure alike.
 
 Reads text on stdin. Streams raw int16 PCM to stdout with --output-raw, or

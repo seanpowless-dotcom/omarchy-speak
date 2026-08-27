@@ -1,0 +1,21 @@
+pkgbase = omarchy-speak
+	pkgdesc = System-wide text-to-speech for Omarchy, driven by Hyprland keybinds
+	pkgver = 0.1.0
+	pkgrel = 1
+	url = https://github.com/YOURNAME/omarchy-speak
+	arch = any
+	license = MIT
+	depends = python
+	depends = bash
+	depends = curl
+	depends = wl-clipboard
+	depends = alsa-utils
+	optdepends = python-gobject: save-location file chooser
+	optdepends = gtk4: save-location file chooser
+	optdepends = xdg-desktop-portal-gtk: route the file chooser through the desktop portal
+	optdepends = libpulse: paplay, for engines configured in file mode
+	optdepends = python-onnxruntime: run kokoro against the system python instead of a venv
+	source = omarchy-speak-0.1.0.tar.gz::https://github.com/YOURNAME/omarchy-speak/archive/refs/tags/v0.1.0.tar.gz
+	sha256sums = SKIP
+
+pkgname = omarchy-speak

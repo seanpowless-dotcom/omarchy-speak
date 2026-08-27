@@ -6,9 +6,21 @@ SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN="$HOME/.local/bin"
 mkdir -p "$BIN"
 
-install -Dm755 "$SRC/bin/omarchy-speak"     "$BIN/omarchy-speak"
-install -Dm755 "$SRC/bin/omarchy-speak-ctl" "$BIN/omarchy-speak-ctl"
-echo "installed → $BIN/omarchy-speak{,-ctl}"
+install -Dm755 "$SRC/bin/omarchy-speak"        "$BIN/omarchy-speak"
+install -Dm755 "$SRC/bin/omarchy-speak-ctl"    "$BIN/omarchy-speak-ctl"
+install -Dm755 "$SRC/bin/omarchy-speak-picker" "$BIN/omarchy-speak-picker"
+echo "installed → $BIN/omarchy-speak{,-ctl,-picker}"
+
+# kokoro-onnx is a pip package, so it usually lives in a venv rather than in
+# the system python. Point the wrapper at that venv if it exists; otherwise
+# leave the portable shebang, which works when kokoro-onnx is importable
+# system-wide (an AUR/distro install, say).
+KOKORO_VENV="$HOME/.local/share/omarchy-speak/venv/bin/python"
+install -Dm755 "$SRC/bin/omarchy-speak-kokoro" "$BIN/omarchy-speak-kokoro"
+if [[ -x "$KOKORO_VENV" ]]; then
+  sed -i "1s|.*|#!$KOKORO_VENV|" "$BIN/omarchy-speak-kokoro"
+  echo "kokoro wrapper pointed at $KOKORO_VENV"
+fi
 
 [[ -f "$HOME/.config/omarchy-speak/config.json" ]] \
   || "$BIN/omarchy-speak" --init-config
