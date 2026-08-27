@@ -81,15 +81,34 @@ print(json.dumps(body))
     post /speak "$body" >/dev/null
     ;;
   save)
+    engine="${2:-}"; dest="${3:-}"
+
+    # No explicit path: ask, unless the config says to use the default location.
+    if [[ -z "$dest" ]]; then
+      prompt=$(curl -sS -m 5 "$BASE/config" 2>/dev/null \
+        | python3 -c 'import json,sys;print(json.load(sys.stdin).get("save_prompt", True))' 2>/dev/null)
+      if [[ "$prompt" == "True" ]]; then
+        suggested="speak-$(date +%Y%m%d-%H%M%S).wav"
+        start=$(curl -sS -m 5 "$BASE/config" 2>/dev/null \
+          | python3 -c 'import json,sys,os;print(os.path.expanduser(json.load(sys.stdin).get("save_dir","~")))' 2>/dev/null)
+        dest=$(omarchy-speak-picker "$suggested" "${start:-$HOME}")
+        case $? in
+          1) exit 0 ;;                      # user cancelled -- not an error
+          2) dest="" ;;                     # no picker available; fall through
+        esac
+      fi
+    fi
+
     body=$(python3 -c '
 import json, sys
 body = {"source": "primary"}
 if sys.argv[1]: body["engine"] = sys.argv[1]
 if sys.argv[2]: body["path"] = sys.argv[2]
 print(json.dumps(body))
-' "${2:-}" "${3:-}")
+' "$engine" "$dest")
     out=$(post /save "$body")
-    notify "Speak: saved" "$(python3 -c 'import json,sys;print(json.load(sys.stdin)["path"])' <<<"$out")"
+    saved=$(python3 -c 'import json,sys;print(json.load(sys.stdin)["path"])' <<<"$out")
+    notify "Speak: saved" "$saved"
     ;;
   status)
     curl -sS -m 5 "$BASE/status" | python3 -m json.tool 2>/dev/null \

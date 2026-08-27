@@ -24,6 +24,10 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+SCRATCH = Path(
+    os.environ.get("XDG_RUNTIME_DIR", "/tmp")
+) / "omarchy-speak"
+
 CONFIG_PATH = Path(
     os.environ.get("OMARCHY_SPEAK_CONFIG", "~/.config/omarchy-speak/config.json")
 ).expanduser()
@@ -33,6 +37,8 @@ DEFAULT_CONFIG = {
     "port": 8765,
     "default_engine": "piper",
     "save_dir": "~/Audio/speak",
+    # True: ask where to save. False: write straight to save_dir.
+    "save_prompt": True,
     "max_chars": 20000,
     "engines": {
         # mode "stream": engine writes raw audio to stdout, piped straight to
@@ -55,6 +61,24 @@ DEFAULT_CONFIG = {
         },
     },
 }
+
+
+def sweep_scratch() -> int:
+    """Delete temp audio orphaned by a crash or a kill mid-playback.
+
+    Playback normally unlinks its own file, but a SIGKILL leaves it behind.
+    Sweeping at startup keeps that from accumulating across sessions.
+    """
+    if not SCRATCH.is_dir():
+        return 0
+    removed = 0
+    for stale in SCRATCH.glob("speak-*.wav"):
+        try:
+            stale.unlink()
+            removed += 1
+        except OSError:
+            pass
+    return removed
 
 
 def load_config() -> dict:
@@ -111,6 +135,7 @@ class Player:
         self._procs: list[subprocess.Popen] = []
         self._engine: str | None = None
         self._started: float = 0.0
+        self._tmp: Path | None = None  # file-mode scratch, removed after playback
 
     @property
     def busy(self) -> bool:
@@ -142,6 +167,9 @@ class Player:
                     proc.kill()
             self._procs = []
             self._engine = None
+            if self._tmp is not None:
+                self._tmp.unlink(missing_ok=True)
+                self._tmp = None
             return was_running
 
     def speak(self, text: str, engine: str, spec: dict) -> None:
@@ -179,17 +207,21 @@ class Player:
         return [tts, play]
 
     def _spawn_file(self, text: str, spec: dict) -> list[subprocess.Popen]:
-        tmp = Path(f"/tmp/omarchy-speak-{os.getpid()}-{int(time.time()*1000)}.wav")
+        tmp = SCRATCH / f"speak-{os.getpid()}-{int(time.time()*1000)}.wav"
+        tmp.parent.mkdir(parents=True, exist_ok=True)
         synth = subprocess.run(
             render(spec["save"], out=str(tmp), **spec),
             input=text.encode(), capture_output=True,
         )
         if synth.returncode != 0 or not tmp.exists():
+            tmp.unlink(missing_ok=True)  # a failed run may still have written bytes
             err = synth.stderr.decode("utf-8", "replace")[:400]
             raise RuntimeError(f"synthesis failed: {err or 'no output produced'}")
         play = subprocess.Popen(
             render(spec["play"], out=str(tmp), **spec), stderr=subprocess.DEVNULL,
         )
+
+        self._tmp = tmp
 
         def cleanup() -> None:
             play.wait()
@@ -229,6 +261,13 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path in ("/health", "/status"):
             self._send(200, {"ok": True, **self.server.player.status()})
+        elif self.path == "/config":
+            cfg = self.server.config
+            self._send(200, {
+                "save_dir": cfg["save_dir"],
+                "save_prompt": cfg.get("save_prompt", True),
+                "default_engine": cfg["default_engine"],
+            })
         elif self.path == "/engines":
             cfg = self.server.config
             self._send(200, {
@@ -354,8 +393,10 @@ def main() -> int:
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
 
+    swept = sweep_scratch()
     print(f"omarchy-speak on http://{cfg['host']}:{cfg['port']} "
-          f"(engine: {cfg['default_engine']})", flush=True)
+          f"(engine: {cfg['default_engine']})"
+          + (f" [swept {swept} stale temp files]" if swept else ""), flush=True)
     server.serve_forever()
     return 0
 

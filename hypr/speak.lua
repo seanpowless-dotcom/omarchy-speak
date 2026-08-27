@@ -14,7 +14,8 @@ o.bind("SUPER + SHIFT + R", "Speak selection (kokoro)", "omarchy-speak-ctl selec
 -- Read the clipboard rather than the selection.
 o.bind("SUPER + ALT + R", "Speak clipboard", "omarchy-speak-ctl clipboard")
 
--- Render the selection to an audio file.
+-- Render the selection to an audio file. Opens a file chooser unless
+-- save_prompt is false in the config; pass a path to always skip the chooser.
 o.bind("SUPER + SHIFT + ALT + R", "Save selection as audio", "omarchy-speak-ctl save kokoro")
 
 -- Hard stop, without needing to re-select.

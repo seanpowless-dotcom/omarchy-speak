@@ -13,7 +13,8 @@ covers every application at once.
 
 - **Speak the selection** — anything highlighted, in any app
 - **Speak the clipboard** — for text that isn't selectable
-- **Save to file** — render the selection to a wav in a configurable location
+- **Save to file** — render the selection to a wav, with a file picker or straight
+  to a default location
 - **Interrupt** — a second press stops playback; a new utterance replaces the old one
 - **Two engines** — fast by default, high-quality on a modifier
 - **Streaming** — both engines start speaking before synthesis finishes
@@ -117,6 +118,41 @@ Keys were checked against `omarchy menu keybindings --print` before choosing;
 `SUPER+SHIFT+S` and the `SUPER+CTRL+R` family are Omarchy defaults, so the
 whole feature lives on `R` with modifiers.
 | `SUPER + SHIFT + ALT + R` | Save selection to audio |
+
+## Audio files
+
+Speaking writes **nothing to disk**. Both engines run in `stream` mode, so audio
+is piped from the engine straight into the player and never lands in a file.
+There is no cache to purge and nothing accumulates from normal use.
+
+Engines configured in `file` mode do use a scratch file, under
+`$XDG_RUNTIME_DIR/omarchy-speak/`. It is removed when playback ends, when
+playback is interrupted, and when synthesis fails partway through. Anything
+orphaned by a crash is swept at daemon startup. `XDG_RUNTIME_DIR` is tmpfs and
+cleared at logout, so a leak there costs RAM until reboot rather than disk.
+
+The only files kept are the ones you deliberately save.
+
+### Where saves go
+
+`save_prompt` in the config decides:
+
+- `true` (default) — a file chooser opens, starting in `save_dir` with a
+  timestamped name filled in. Cancelling saves nothing and is not an error.
+- `false` — writes straight to `save_dir` with no dialog.
+
+Passing an explicit path to `omarchy-speak-ctl save` skips the chooser either
+way, so you can bind one key that asks and another that does not:
+
+```lua
+o.bind("SUPER + SHIFT + ALT + R", "Save selection as audio", "omarchy-speak-ctl save kokoro")
+o.bind("SUPER + CTRL + ALT + S", "Save selection (no prompt)", "omarchy-speak-ctl save kokoro ~/Audio/speak/quick.wav")
+```
+
+The chooser is `omarchy-speak-picker`, a GTK4 `FileDialog` that routes through
+`xdg-desktop-portal` on Wayland, so it uses whatever file manager the desktop is
+configured for. If GTK bindings are missing it exits 2 and the save falls back
+to `save_dir` rather than failing.
 
 ## Configuration
 
