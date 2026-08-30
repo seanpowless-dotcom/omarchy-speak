@@ -10,6 +10,9 @@ utterance. Run `--serve` to keep a warm worker holding the model on a unix
 socket; the CLI then connects to it automatically and starts synthesising
 immediately. With no worker running it loads the model in-process as before,
 so the socket is an optimisation and never a requirement.
+
+Runs on the GPU where onnxruntime-gpu and a usable CUDA device are present,
+and on the CPU otherwise; --provider forces the choice either way.
 """
 
 from __future__ import annotations
@@ -37,7 +40,33 @@ CHUNK = 8192
 
 
 # ── model ────────────────────────────────────────────────────────────────
-def build(model_name: str, voices_name: str):
+def resolve_provider(preference: str) -> str:
+    """Pick an onnxruntime execution provider.
+
+    onnxruntime-gpu advertises CUDAExecutionProvider whenever the GPU build is
+    installed, but CUDA and cuDNN arrive as separate pip packages that are not
+    on the loader path — so "advertised" is not "loadable". preload_dlls()
+    brings them in; without it the session silently lands back on the CPU.
+    """
+    import onnxruntime as rt
+
+    if preference == "cpu":
+        return "CPUExecutionProvider"
+
+    try:
+        rt.preload_dlls()
+    except Exception:  # noqa: BLE001 - an old runtime without the helper
+        pass
+
+    if "CUDAExecutionProvider" in rt.get_available_providers():
+        return "CUDAExecutionProvider"
+    if preference == "cuda":
+        sys.exit("kokoro: --provider cuda, but onnxruntime has no CUDA provider\n"
+                 "install it with: pip install 'onnxruntime-gpu[cuda,cudnn]'")
+    return "CPUExecutionProvider"
+
+
+def build(model_name: str, voices_name: str, provider: str = "auto"):
     from kokoro_onnx import Kokoro
 
     model, voices = DATA / model_name, DATA / voices_name
@@ -45,7 +74,20 @@ def build(model_name: str, voices_name: str):
         if not path.exists():
             sys.exit(f"kokoro: missing {path}\n"
                      f"download the model files into {DATA}")
-    return Kokoro(str(model), str(voices))
+
+    chosen = resolve_provider(provider)
+    os.environ["ONNX_PROVIDER"] = chosen  # kokoro_onnx reads the provider from here
+    try:
+        return Kokoro(str(model), str(voices))
+    except Exception as exc:  # noqa: BLE001
+        # A GPU that enumerates but cannot build a session (driver mismatch, an
+        # eGPU unplugged since boot, VRAM exhausted) must not cost us the voice
+        # entirely — the CPU path is slower but always there.
+        if chosen == "CPUExecutionProvider" or provider == "cuda":
+            raise
+        print(f"kokoro: GPU init failed ({exc}); using CPU", file=sys.stderr)
+        os.environ["ONNX_PROVIDER"] = "CPUExecutionProvider"
+        return Kokoro(str(model), str(voices))
 
 
 def to_pcm16(samples) -> bytes:
@@ -78,7 +120,7 @@ def synth_to_file(kokoro, req: dict) -> None:
 
 # ── warm worker ──────────────────────────────────────────────────────────
 def serve(args) -> int:
-    kokoro = build(args.model, args.voices)
+    kokoro = build(args.model, args.voices, args.provider)
     lock = threading.Lock()  # one onnx session; serialise callers
 
     SOCKET_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -88,7 +130,8 @@ def serve(args) -> int:
     server.bind(str(SOCKET_PATH))
     SOCKET_PATH.chmod(0o600)
     server.listen(8)
-    print(f"kokoro worker ready on {SOCKET_PATH}", flush=True)
+    ep = kokoro.sess.get_providers()[0].replace("ExecutionProvider", "")
+    print(f"kokoro worker ready on {SOCKET_PATH} [{ep}]", flush=True)
 
     def handle(conn: socket.socket) -> None:
         with conn:
@@ -179,12 +222,15 @@ def main() -> int:
     ap.add_argument("--list-voices", action="store_true")
     ap.add_argument("--serve", action="store_true",
                     help="run as a warm worker holding the model in memory")
+    ap.add_argument("--provider", choices=("auto", "cuda", "cpu"), default="auto",
+                    help="onnxruntime execution provider (default: GPU if usable)")
     args = ap.parse_args()
 
     if args.serve:
         return serve(args)
     if args.list_voices:
-        print("\n".join(sorted(build(args.model, args.voices).get_voices())))
+        print("\n".join(sorted(
+            build(args.model, args.voices, args.provider).get_voices())))
         return 0
 
     text = sys.stdin.read().strip()
@@ -202,7 +248,7 @@ def main() -> int:
         return 0
 
     # No worker: load the model here and do it ourselves.
-    kokoro = build(args.model, args.voices)
+    kokoro = build(args.model, args.voices, args.provider)
     if args.output_file:
         synth_to_file(kokoro, req)
         return 0

@@ -15,8 +15,12 @@ covers every application at once.
 - **Speak the clipboard** — for text that isn't selectable
 - **Save to file** — render the selection to a wav, with a file picker or straight
   to a default location
-- **Interrupt** — a second press stops playback; a new utterance replaces the old one
+- **Play/pause** — a second press suspends mid-word; a third picks up where it left off
+- **A queue** — stack up clips as you find them and they read in turn, with
+  forward and back
 - **Two engines** — fast by default, high-quality on a modifier
+- **GPU** — kokoro runs on CUDA when a usable GPU is present, and falls back to
+  the CPU when it isn't
 - **Streaming** — both engines start speaking before synthesis finishes
 
 ## Requirements
@@ -39,7 +43,7 @@ Then point `engines.piper.model` at the `.onnx` file, and set the `-r` value in
 `.onnx.json` under `audio.sample_rate`). `config.example.json` is a working
 piper setup you can copy.
 
-Installing kokoro (ONNX build — CPU only, no torch):
+Installing kokoro (ONNX build, no torch):
 
 ```bash
 uv venv --python 3.12 ~/.local/share/omarchy-speak/venv
@@ -100,6 +104,44 @@ immediately.
 
 The daemon itself is Python stdlib only — no pip install, no virtualenv.
 
+### On the GPU
+
+kokoro will use CUDA if it can. Swap the CPU runtime for the GPU one in the
+same venv:
+
+```bash
+uv pip uninstall --python ~/.local/share/omarchy-speak/venv/bin/python onnxruntime
+uv pip install --python ~/.local/share/omarchy-speak/venv/bin/python \
+  'onnxruntime-gpu[cuda,cudnn]'
+systemctl --user restart omarchy-speak-kokoro
+```
+
+No system CUDA toolkit is needed — the `[cuda,cudnn]` extras pull the runtime
+in as pip packages. The worker prints which provider it settled on:
+
+```
+kokoro worker ready on /run/user/1000/omarchy-speak-kokoro.sock [CUDA]
+```
+
+Measured here on a Quadro RTX 3000, synthesising 8.1s of speech:
+
+| | synthesis | realtime factor |
+| --- | --- | --- |
+| CPU | 3.56s | 2.3x |
+| CUDA | **0.38s** | **21.5x** |
+
+It costs ~630MB of VRAM, held for as long as the worker runs. On a card that is
+also driving your display, that is the trade: `--provider cpu` declines it.
+
+Selection is deliberately forgiving, because a GPU is not a stable fact on a
+laptop — an eGPU gets unplugged, a driver gets upgraded out from under a running
+system. `auto` (the default) uses CUDA when a session actually builds on it and
+CPU when one doesn't, so a missing GPU costs latency rather than the voice.
+Note that onnxruntime *advertises* `CUDAExecutionProvider` whenever the GPU
+build is installed, even when the CUDA libraries are unreachable — the wrapper
+calls `preload_dlls()` and then builds a real session rather than trusting that
+list.
+
 ## Install
 
 From source, into `~/.local/bin`:
@@ -154,15 +196,41 @@ Check for conflicts before committing to keys — on Omarchy,
 
 | Key | Action |
 | --- | --- |
-| `SUPER + R` | Speak selection (press again to stop) |
+| `SUPER + R` | Speak selection — press again to pause, again to resume |
 | `SUPER + SHIFT + R` | Speak selection with kokoro |
 | `SUPER + ALT + R` | Speak clipboard |
-| `SUPER + SHIFT + ESC` | Stop |
+| `SUPER + SHIFT + ]` | Queue the selection behind what's playing |
+| `SUPER + ]` | Next clip in the queue |
+| `SUPER + [` | Previous clip — or restart this one |
+| `SUPER + SHIFT + ALT + R` | Save selection to audio |
+| `SUPER + SHIFT + ESC` | Stop, and empty the queue |
 
 Keys were checked against `omarchy menu keybindings --print` before choosing;
 `SUPER+SHIFT+S` and the `SUPER+CTRL+R` family are Omarchy defaults, so the
-whole feature lives on `R` with modifiers.
-| `SUPER + SHIFT + ALT + R` | Save selection to audio |
+speaking lives on `R` with modifiers and the queue on the bracket pair next to
+it (`SUPER+ALT+[`/`]` belong to the webcam overlay, hence the `SHIFT` for
+queueing).
+
+## The queue
+
+Speaking replaces; queueing appends. `SUPER+R` on a fresh selection throws away
+whatever was queued and reads the new thing — the common case, and the old
+behaviour. `SUPER+SHIFT+]` instead parks the selection behind what is already
+playing, so you can skim a page, queue three paragraphs as you find them, and
+let them read in order while you keep reading.
+
+Pause is a real pause. `SUPER+R` during playback sends `SIGSTOP` to the engine
+and the player rather than killing them, so resuming continues mid-word instead
+of restarting the clip. The synthesiser needs no special handling: once the
+player stops draining the pipe, it blocks on a full buffer by itself. ALSA may
+click faintly on resume as the card refills — the cost of not re-synthesising.
+
+Back (`SUPER+[`) restarts the current clip if you are more than three seconds
+into it, and only steps to the previous one if you are not — the same bargain
+every music player makes, and for the same reason: the common use of "back" is
+"say that again".
+
+`SUPER+SHIFT+ESC` is the hard stop, and empties the queue with it.
 
 ## Audio files
 
@@ -234,13 +302,23 @@ just `curl` in a trenchcoat.
 
 | Method | Path | Body | Purpose |
 | --- | --- | --- | --- |
-| `GET` | `/status` | | Is it speaking, and with what |
+| `GET` | `/status` | | Is it speaking, paused, and where in the queue |
 | `GET` | `/engines` | | Configured engines |
-| `POST` | `/speak` | `{"text":…, "engine":…}` | Speak literal text |
+| `GET` | `/queue` | | The queue, and which clip is current |
+| `POST` | `/speak` | `{"text":…, "engine":…}` | Speak literal text, replacing the queue |
 | `POST` | `/speak/selection` | `{"engine":…}` | Speak the primary selection |
 | `POST` | `/speak/clipboard` | `{"engine":…}` | Speak the clipboard |
+| `POST` | `/queue` | `{"text":…, "engine":…}` | Append text to the queue |
+| `POST` | `/queue/selection` | `{"engine":…}` | Append the primary selection |
+| `POST` | `/queue/clipboard` | `{"engine":…}` | Append the clipboard |
+| `POST` | `/queue/clear` | | Drop everything except what is playing |
+| `POST` | `/playpause` | `{"engine":…}` | Resume, or pause, or start on the selection |
+| `POST` | `/pause` | | Suspend playback |
+| `POST` | `/resume` | | Continue a suspended clip |
+| `POST` | `/next` | | Skip to the next clip |
+| `POST` | `/prev` | | Restart this clip, or step back |
 | `POST` | `/save` | `{"engine":…, "path":…}` | Render to a file |
-| `POST` | `/stop` | | Stop playback |
+| `POST` | `/stop` | | Stop playback and empty the queue |
 | `POST` | `/toggle` | `{"engine":…}` | Stop if speaking, else speak selection |
 
 ```bash

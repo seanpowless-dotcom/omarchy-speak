@@ -2,9 +2,11 @@
 """omarchy-speak — a small local TTS daemon for Omarchy.
 
 Speaks the primary selection, the clipboard, or arbitrary text through a
-configurable engine (piper for speed, kokoro for quality). Exposes a tiny
-HTTP API on loopback so any client — Hyprland keybinds, a status-bar widget,
-a browser extension — can drive the same backend.
+configurable engine (piper for speed, kokoro for quality). Clips can be queued
+and played in turn, paused mid-word and resumed, or stepped through forwards
+and back. Exposes a tiny HTTP API on loopback so any client — Hyprland
+keybinds, a status-bar widget, a browser extension — can drive the same
+backend.
 
 Stdlib only. No runtime dependencies beyond the TTS engines themselves.
 """
@@ -128,62 +130,242 @@ def render(template: list[str], **fields) -> list[str]:
     return parts
 
 
+class Clip:
+    """One queued utterance."""
+
+    __slots__ = ("text", "engine", "spec")
+
+    def __init__(self, text: str, engine: str, spec: dict) -> None:
+        self.text, self.engine, self.spec = text, engine, spec
+
+    @property
+    def label(self) -> str:
+        """A one-line preview, for /status and /queue."""
+        flat = " ".join(self.text.split())
+        return flat[:60] + ("…" if len(flat) > 60 else "")
+
+
 class Player:
-    """Single-flight audio playback. Starting a new utterance stops the old one."""
+    """Queue-driven playback: one clip sounds, the rest wait their turn.
+
+    Pause suspends the process chain with SIGSTOP rather than tearing it down,
+    so resuming continues mid-word instead of restarting the clip. The
+    synthesiser needs no separate handling — once the player stops draining the
+    pipe, it blocks on a full buffer by itself.
+    """
+
+    RESTART_WINDOW = 3.0  # seconds into a clip after which "back" restarts it
 
     def __init__(self) -> None:
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._procs: list[subprocess.Popen] = []
-        self._engine: str | None = None
-        self._started: float = 0.0
         self._tmp: Path | None = None  # file-mode scratch, removed after playback
+        self._queue: list[Clip] = []
+        self._index = -1               # position in _queue; -1 when idle
+        self._paused = False
+        self._gen = 0                  # retires the watcher of a superseded clip
+        self._started = 0.0
+        self._paused_at = 0.0
+        self._paused_for = 0.0
+
+    # -- state ------------------------------------------------------------
+    def _running(self) -> bool:
+        return any(p.poll() is None for p in self._procs)
 
     @property
     def busy(self) -> bool:
         with self._lock:
-            return any(p.poll() is None for p in self._procs)
+            return self._running()
+
+    def _elapsed(self) -> float:
+        held = self._paused_for
+        if self._paused:
+            held += time.time() - self._paused_at
+        return max(0.0, time.time() - self._started - held)
+
+    def _current(self) -> Clip | None:
+        if 0 <= self._index < len(self._queue):
+            return self._queue[self._index]
+        return None
 
     def status(self) -> dict:
         with self._lock:
-            speaking = any(p.poll() is None for p in self._procs)
+            live = self._running()
+            clip = self._current() if live else None
             return {
-                "speaking": speaking,
-                "engine": self._engine if speaking else None,
-                "elapsed": round(time.time() - self._started, 2) if speaking else 0,
+                "speaking": live and not self._paused,
+                "paused": live and self._paused,
+                "engine": clip.engine if clip else None,
+                "elapsed": round(self._elapsed(), 2) if live else 0,
+                "index": self._index if live else -1,
+                "queued": len(self._queue),
+                "current": clip.label if clip else None,
             }
 
-    def stop(self) -> bool:
-        """Terminate the current chain. Returns True if something was playing."""
+    def queue(self) -> dict:
         with self._lock:
-            was_running = any(p.poll() is None for p in self._procs)
-            for proc in reversed(self._procs):
-                if proc.poll() is None:
-                    proc.terminate()
-            deadline = time.time() + 2
+            return {
+                "index": self._index,
+                "items": [
+                    {"n": i, "engine": c.engine, "text": c.label,
+                     "current": i == self._index}
+                    for i, c in enumerate(self._queue)
+                ],
+            }
+
+    # -- transport --------------------------------------------------------
+    @staticmethod
+    def _signal(proc: subprocess.Popen, sig: int) -> None:
+        try:
+            if proc.poll() is None:
+                proc.send_signal(sig)
+        except OSError:
+            pass
+
+    def _teardown(self) -> bool:
+        """Kill the current chain, leaving the queue alone. Caller holds the lock."""
+        was_running = self._running()
+        if self._paused:
+            # A SIGSTOPped process never gets to act on SIGTERM. Wake it first.
             for proc in self._procs:
-                remaining = max(0, deadline - time.time())
-                try:
-                    proc.wait(timeout=remaining)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-            self._procs = []
-            self._engine = None
-            if self._tmp is not None:
-                self._tmp.unlink(missing_ok=True)
-                self._tmp = None
+                self._signal(proc, signal.SIGCONT)
+            self._paused = False
+        for proc in reversed(self._procs):
+            if proc.poll() is None:
+                proc.terminate()
+        deadline = time.time() + 2
+        for proc in self._procs:
+            try:
+                proc.wait(timeout=max(0, deadline - time.time()))
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        self._procs = []
+        if self._tmp is not None:
+            self._tmp.unlink(missing_ok=True)
+            self._tmp = None
+        return was_running
+
+    def stop(self) -> bool:
+        """Hard stop: silence playback and forget the queue."""
+        with self._lock:
+            self._gen += 1
+            was_running = self._teardown()
+            self._queue = []
+            self._index = -1
             return was_running
 
-    def speak(self, text: str, engine: str, spec: dict) -> None:
-        self.stop()
-        mode = spec.get("mode", "stream")
-        if mode == "stream":
-            procs = self._spawn_stream(text, spec)
-        else:
-            procs = self._spawn_file(text, spec)
+    def _play(self, i: int) -> bool:
         with self._lock:
+            if not 0 <= i < len(self._queue):
+                return False
+            clip = self._queue[i]
+            self._gen += 1
+            gen = self._gen
+            self._teardown()
+
+        # A file-mode engine synthesises here, which can take seconds — so it
+        # runs outside the lock, keeping /status answerable throughout.
+        spec = clip.spec
+        spawn = (self._spawn_stream if spec.get("mode", "stream") == "stream"
+                 else self._spawn_file)
+        procs = spawn(clip.text, spec)
+
+        with self._lock:
+            if gen != self._gen:  # superseded while we were synthesising
+                for proc in reversed(procs):
+                    if proc.poll() is None:
+                        proc.terminate()
+                return False
             self._procs = procs
-            self._engine = engine
+            self._index = i
+            self._paused = False
             self._started = time.time()
+            self._paused_for = 0.0
+        threading.Thread(target=self._watch, args=(gen, procs[-1]),
+                         daemon=True).start()
+        return True
+
+    def _watch(self, gen: int, play: subprocess.Popen) -> None:
+        """Advance the queue when a clip ends of its own accord.
+
+        wait() does not return for a SIGSTOPped child, so a paused clip simply
+        parks this thread until it resumes or is torn down.
+        """
+        play.wait()
+        with self._lock:
+            if gen != self._gen:
+                return  # stopped, skipped, or replaced — no longer ours to advance
+            nxt = self._index + 1
+            if nxt >= len(self._queue):
+                self._procs = []
+                self._index = -1
+                return
+        self._play(nxt)
+
+    def speak(self, text: str, engine: str, spec: dict) -> None:
+        """Replace the queue with this one clip and play it."""
+        with self._lock:
+            self._gen += 1
+            self._teardown()
+            self._queue = [Clip(text, engine, spec)]
+            self._index = -1
+        self._play(0)
+
+    def enqueue(self, clip: Clip) -> dict:
+        """Append to the queue, starting playback if nothing is sounding."""
+        with self._lock:
+            self._queue.append(clip)
+            position = len(self._queue) - 1
+            idle = not self._running()
+        if idle:
+            self._play(position)
+        return {"position": position, "queued": position + 1, "started": idle}
+
+    def clear(self) -> int:
+        """Drop everything not currently playing."""
+        with self._lock:
+            clip = self._current()
+            dropped = len(self._queue) - (1 if clip else 0)
+            self._queue = [clip] if clip else []
+            self._index = 0 if clip else -1
+            return max(0, dropped)
+
+    def next(self) -> bool:
+        with self._lock:
+            nxt = self._index + 1
+            if not 0 <= nxt < len(self._queue):
+                return False
+        return self._play(nxt)
+
+    def prev(self) -> bool:
+        """Back one clip — or restart this one, if we are well into it."""
+        with self._lock:
+            if self._index < 0:
+                return False
+            target = self._index
+            if self._elapsed() < self.RESTART_WINDOW:
+                target = max(0, self._index - 1)
+        return self._play(target)
+
+    def pause(self) -> bool:
+        with self._lock:
+            if self._paused or not self._running():
+                return False
+            for proc in self._procs:
+                self._signal(proc, signal.SIGSTOP)
+            self._paused = True
+            self._paused_at = time.time()
+            return True
+
+    def resume(self) -> bool:
+        with self._lock:
+            if not self._paused:
+                return False
+            for proc in self._procs:
+                self._signal(proc, signal.SIGCONT)
+            self._paused_for += time.time() - self._paused_at
+            self._paused = False
+            return True
 
     def _spawn_stream(self, text: str, spec: dict) -> list[subprocess.Popen]:
         tts_cmd = render(spec["speak"], **spec)
@@ -275,6 +457,8 @@ class Handler(BaseHTTPRequestHandler):
                 "default": cfg["default_engine"],
                 "engines": sorted(cfg["engines"]),
             })
+        elif self.path == "/queue":
+            self._send(200, {"ok": True, **self.server.player.queue()})
         else:
             self._send(404, {"error": "not found"})
 
@@ -283,9 +467,18 @@ class Handler(BaseHTTPRequestHandler):
             "/speak": self._speak,
             "/speak/selection": lambda b: self._speak(b, source="primary"),
             "/speak/clipboard": lambda b: self._speak(b, source="clipboard"),
+            "/queue": self._enqueue,
+            "/queue/selection": lambda b: self._enqueue(b, source="primary"),
+            "/queue/clipboard": lambda b: self._enqueue(b, source="clipboard"),
+            "/queue/clear": self._clear,
             "/save": self._save,
             "/stop": self._stop,
             "/toggle": self._toggle,
+            "/playpause": self._playpause,
+            "/pause": self._pause,
+            "/resume": self._resume,
+            "/next": self._next,
+            "/prev": self._prev,
         }
         handler = routes.get(self.path)
         if not handler:
@@ -367,6 +560,47 @@ class Handler(BaseHTTPRequestHandler):
         text, engine, spec = self._resolve(body, "primary")
         self.server.player.speak(text, engine, spec)
         self._send(200, {"ok": True, "action": "speaking", "engine": engine})
+
+    def _enqueue(self, body: dict, source: str | None = None) -> None:
+        if source is None:
+            # Literal text wins; otherwise queueing means the selection.
+            source = body.get("source") or (None if body.get("text") else "primary")
+        text, engine, spec = self._resolve(body, source)
+        result = self.server.player.enqueue(Clip(text, engine, spec))
+        self._send(200, {"ok": True, "engine": engine, "chars": len(text),
+                         **result})
+
+    def _clear(self, body: dict) -> None:
+        self._send(200, {"ok": True, "dropped": self.server.player.clear()})
+
+    def _playpause(self, body: dict) -> None:
+        """Resume, or pause, or — with nothing loaded — speak the selection."""
+        player = self.server.player
+        if player.resume():
+            self._send(200, {"ok": True, "action": "resumed"})
+            return
+        if player.pause():
+            self._send(200, {"ok": True, "action": "paused"})
+            return
+        text, engine, spec = self._resolve(body, "primary")
+        player.speak(text, engine, spec)
+        self._send(200, {"ok": True, "action": "speaking", "engine": engine})
+
+    def _pause(self, body: dict) -> None:
+        self._send(200, {"ok": True, "paused": self.server.player.pause()})
+
+    def _resume(self, body: dict) -> None:
+        self._send(200, {"ok": True, "resumed": self.server.player.resume()})
+
+    def _next(self, body: dict) -> None:
+        moved = self.server.player.next()
+        self._send(200, {"ok": True, "moved": moved,
+                         **self.server.player.status()})
+
+    def _prev(self, body: dict) -> None:
+        moved = self.server.player.prev()
+        self._send(200, {"ok": True, "moved": moved,
+                         **self.server.player.status()})
 
 
 def main() -> int:
