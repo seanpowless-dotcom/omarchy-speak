@@ -318,6 +318,65 @@ and lets the terminal make the selection itself. In foot that is
 kitty and ghostty follow the same Shift convention, though check your own config if you
 have rebound it.
 
+## When nothing plays
+
+Every keybind looks dead, both engines are silent, and the journal says nothing.
+The daemon is usually fine — **check where the audio is going before suspecting
+the TTS.**
+
+The common cause is a **Bluetooth speaker that is connected but asleep.** BlueZ
+reports it connected, PipeWire keeps its node alive as the default sink, and
+audio is accepted by something that never plays it. Short clips vanish into the
+buffer without a sound; long ones fill it and then block forever.
+
+`Connected: yes` is not sufficient evidence that audio can flow:
+
+```console
+$ wpctl status | sed -n '/Sinks:/,/Sources:/p'
+ │  *   90. JBL Xtreme 2                 ← default, and possibly asleep
+ │      43. Built-in Audio Analog Stereo
+
+$ bluetoothctl devices Connected        # BlueZ's view, not PipeWire's
+```
+
+The fix is to wake the speaker (press its power button) or move output
+elsewhere:
+
+```console
+$ wpctl set-default 43
+```
+
+**Sink numbers are reassigned on every reconnect** — the same speaker was 84,
+then 90, within one session. Read the current number out of `wpctl status`
+rather than reusing one from earlier. WirePlumber stores the preference by node
+*name*, so setting it once per device is enough to make it persist.
+
+### What the daemon does about it
+
+It cannot fix your sink, but it no longer hangs quietly on one.
+
+**Stalled playback is killed and logged.** Each clip gets a budget of
+`30s + chars/4` — roughly three times real speech, so a 20,000 character
+article has about 84 minutes before anything intervenes. Past that, the clip is
+almost certainly stuck rather than slow, so the chain is killed and the reason
+goes to the journal. Paused clips are exempt: pausing one over lunch is not a
+stall.
+
+**Engine and player stderr reaches the journal.** Both were previously
+discarded, which is why an outage could leave nothing behind but the daemon's
+own start and stop lines. A non-zero exit from either now reports its output:
+
+```console
+$ journalctl --user -u omarchy-speak -f
+omarchy-speak: playback stalled after 756s (budget 84s) and was killed. The audio
+sink is accepting audio without draining it — a Bluetooth speaker that is
+connected but asleep does exactly this. Check `wpctl status` for the default sink.
+omarchy-speak: player exited 1: aplay: device busy
+```
+
+If playback stops mid-clip and the journal is empty, the sink is not the
+problem and this is worth reporting as a bug.
+
 ## Configuration
 
 `~/.config/omarchy-speak/config.json`, created on first run with `--init-config`.
