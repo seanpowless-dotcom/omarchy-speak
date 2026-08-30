@@ -49,8 +49,15 @@ omarchy-speak-ctl <command> [engine] [path]
   selection [engine]     speak the highlighted text (primary selection)
   clipboard [engine]     speak the clipboard
   say <text> [engine]    speak literal text
+  playpause [engine]     pause, resume, or start on the selection
   toggle [engine]        stop if speaking, else speak the selection
-  stop                   stop playback
+  next                   skip to the next clip in the queue
+  prev                   restart this clip, or step back to the previous one
+  stop                   stop playback and clear the queue
+  enqueue [engine]       add the selection to the end of the queue
+  enqueue-clip [engine]  add the clipboard to the end of the queue
+  queue                  list the queue
+  clear                  drop everything except what is playing
   save [engine] [path]   render the selection to a file
   status                 report daemon state
 
@@ -66,9 +73,53 @@ case "$cmd" in
     out=$(post /toggle "$(json_body "${2:-}")")
     [[ "$out" == *stopped* ]] && notify "Speak: stopped"
     ;;
+  playpause)
+    # Resuming needs no toast — the audio coming back says it. A pause is
+    # worth one, so a silent daemon is not mistaken for a dead one.
+    out=$(post /playpause "$(json_body "${2:-}")")
+    [[ "$out" == *'"action": "paused"'* ]] && notify "Speak: paused"
+    ;;
+  next|prev)
+    out=$(post "/$cmd")
+    python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+cur = d.get("current")
+if not d.get("moved"):
+    print("Speak: end of queue" if sys.argv[1] == "next" else "Speak: start of queue")
+elif cur:
+    print("Speak: " + cur)
+' "$cmd" <<<"$out" | while read -r line; do notify "$line"; done
+    ;;
   stop)
     out=$(post /stop)
     [[ "$out" == *'"stopped": true'* ]] && notify "Speak: stopped"
+    ;;
+  enqueue|enqueue-clip)
+    path=/queue/selection
+    [[ "$cmd" == enqueue-clip ]] && path=/queue/clipboard
+    out=$(post "$path" "$(json_body "${2:-}")")
+    notify "$(python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+print("Speak: playing" if d.get("started") else "Speak: queued (%d)" % d["queued"])
+' <<<"$out")"
+    ;;
+  queue)
+    curl -sS -m 5 "$BASE/queue" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+if not d["items"]:
+    print("queue empty")
+for it in d["items"]:
+    mark = "*" if it["current"] else " "
+    print("%s %2d  [%s]  %s" % (mark, it["n"], it["engine"], it["text"]))
+' || { notify "Speak: daemon not running"; exit 1; }
+    ;;
+  clear)
+    out=$(post /queue/clear)
+    notify "Speak: queue cleared" \
+      "$(python3 -c 'import json,sys;print("%d dropped" % json.load(sys.stdin)["dropped"])' <<<"$out")"
     ;;
   say)
     [[ -z "${2:-}" ]] && { usage; exit 1; }
