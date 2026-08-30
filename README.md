@@ -356,11 +356,27 @@ rather than reusing one from earlier. WirePlumber stores the preference by node
 It cannot fix your sink, but it no longer hangs quietly on one.
 
 **Stalled playback is killed and logged.** Each clip gets a budget of
-`30s + chars/4` — roughly three times real speech, so a 20,000 character
-article has about 84 minutes before anything intervenes. Past that, the clip is
-almost certainly stuck rather than slow, so the chain is killed and the reason
-goes to the journal. Paused clips are exempt: pausing one over lunch is not a
-stall.
+`startup_grace + chars/4` — the second term is roughly three times real speech,
+so a 20,000 character article has about 84 minutes before anything intervenes.
+Past that, the clip is almost certainly stuck rather than slow, so the chain is
+killed and the reason goes to the journal. Paused clips are exempt: pausing one
+over lunch is not a stall.
+
+`startup_grace` is **per engine** (default 30s), because it covers everything
+before the first sample — process spawn, model load, warm-up — and a
+model-loading engine on a slow machine is not stuck merely for being slow to
+start. Kokoro ships declaring `"startup_grace": 60` as headroom for a CPU-only
+machine; on CUDA it starts a 43-character clip in **0.56 seconds**.
+
+Resist making it large. A long grace protects nothing — it only delays
+noticing a broken engine. **A kokoro request that blocks for minutes at
+near-zero CPU has not gone slow, it has wedged**: the warm worker does this
+after long uptimes, and `systemctl --user restart omarchy-speak-kokoro` fixes
+it in one command. Check CPU usage before reaching for a bigger number.
+
+The same budget bounds `/save` and file-mode synthesis, which the watchdog
+cannot reach — they run synchronously, so a wedged engine there would hold the
+request open forever rather than merely playing silence.
 
 **Engine and player stderr reaches the journal.** Both were previously
 discarded, which is why an outage could leave nothing behind but the daemon's
@@ -408,6 +424,11 @@ then it plays).
 `selection_fallback` (default `true`) controls whether speaking the selection falls
 back to the clipboard when nothing is selected — see
 [Terminal applications](#terminal-applications-herdr-tmux-nvim).
+
+`startup_grace` sits inside an **engine** block and is how long that engine may
+take to produce its first sample before playback is presumed stuck. Default 30
+seconds; kokoro ships with 120 because it loads a model. See
+[When nothing plays](#when-nothing-plays).
 
 ## HTTP API
 

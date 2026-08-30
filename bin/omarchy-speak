@@ -63,6 +63,12 @@ DEFAULT_CONFIG = {
         "kokoro": {
             "mode": "stream",
             "voice": "af_sarah",
+            # Loads a model before the first sample, so it needs more headroom
+            # than piper's default. This is headroom for a CPU-only machine, not
+            # a measurement: on CUDA the same clip starts in 0.56s. If kokoro
+            # blocks for longer than this at near-zero CPU, the warm worker has
+            # wedged rather than gone slow -- restart omarchy-speak-kokoro.
+            "startup_grace": 60,
             "speak": ["omarchy-speak-kokoro", "--voice", "{voice}", "--output-raw"],
             "save": ["omarchy-speak-kokoro", "--voice", "{voice}", "--output-file", "{out}"],
             "play": ["aplay", "-q", "-r", "24000", "-f", "S16_LE", "-t", "raw", "-"],
@@ -91,13 +97,34 @@ def log(msg: str) -> None:
 # The budget is deliberately loose -- roughly three times real speech -- so a
 # genuinely long article is never truncated. A 20,000 character read gets about
 # 84 minutes before the watchdog looks at it.
-STALL_GRACE_SECONDS = 30.0
 STALL_CHARS_PER_SECOND = 4.0
 
+# The grace covers everything before the first sample: process spawn, model
+# load, and the engine's own warm-up. It is PER ENGINE because a model-loading
+# engine on a slow machine can take far longer to first sample than a streaming
+# one, and that says nothing about whether it is stuck.
+#
+# Resist the temptation to make it large. A long grace does not protect healthy
+# playback -- it only delays noticing a broken engine. Measured on a machine
+# with CUDA, kokoro produces a 43-character clip in 0.56s; the same request
+# against a warm worker that had wedged blocked for over 180s at ~0% CPU. No
+# grace distinguishes those two, so the grace should be sized for a slow
+# machine's model load and nothing more.
+DEFAULT_STARTUP_GRACE = 30.0
 
-def stall_budget(text: str) -> float:
-    """How long this clip may sound before it is presumed stuck."""
-    return STALL_GRACE_SECONDS + len(text) / STALL_CHARS_PER_SECOND
+
+def stall_budget(text: str, spec: dict) -> float:
+    """How long this clip may sound before it is presumed stuck.
+
+    Startup grace comes from the engine spec, because a model-loading engine on
+    a CPU is slow to first sample in a way that says nothing about whether it is
+    stuck.
+    """
+    try:
+        grace = float(spec.get("startup_grace", DEFAULT_STARTUP_GRACE))
+    except (TypeError, ValueError):
+        grace = DEFAULT_STARTUP_GRACE
+    return max(grace, 1.0) + len(text) / STALL_CHARS_PER_SECOND
 
 
 class ErrorTail:
@@ -431,7 +458,7 @@ class Player:
             self._paused_for = 0.0
         threading.Thread(
             target=self._watch,
-            args=(gen, procs[-1], stall_budget(clip.text), tails),
+            args=(gen, procs[-1], stall_budget(clip.text, spec), tails),
             daemon=True,
         ).start()
         return True
@@ -595,10 +622,21 @@ class Player:
     def _spawn_file(self, text: str, spec: dict) -> tuple[list[subprocess.Popen], list[ErrorTail]]:
         tmp = SCRATCH / f"speak-{os.getpid()}-{int(time.time()*1000)}.wav"
         tmp.parent.mkdir(parents=True, exist_ok=True)
-        synth = subprocess.run(
-            render(spec["save"], out=str(tmp), **spec),
-            input=text.encode(), capture_output=True,
-        )
+        # Same budget as playback, for the same reason: an engine that never
+        # returns would otherwise park this thread forever. The watchdog only
+        # covers the player, so a synchronous synthesis needs its own bound.
+        budget = stall_budget(text, spec)
+        try:
+            synth = subprocess.run(
+                render(spec["save"], out=str(tmp), **spec),
+                input=text.encode(), capture_output=True, timeout=budget,
+            )
+        except subprocess.TimeoutExpired:
+            tmp.unlink(missing_ok=True)
+            raise RuntimeError(
+                f"synthesis timed out after {budget:.0f}s. Raise startup_grace for "
+                f"this engine if it is merely slow to load its model."
+            ) from None
         if synth.returncode != 0 or not tmp.exists():
             tmp.unlink(missing_ok=True)  # a failed run may still have written bytes
             err = synth.stderr.decode("utf-8", "replace")[:400]
@@ -767,10 +805,21 @@ class Handler(BaseHTTPRequestHandler):
             out = Path(cfg["save_dir"]).expanduser() / f"speak-{stamp}.wav"
         out.parent.mkdir(parents=True, exist_ok=True)
 
-        result = subprocess.run(
-            render(spec["save"], out=str(out), **spec),
-            input=text.encode(), capture_output=True,
-        )
+        # /save renders without playing, so nothing is waiting to hear it and a
+        # slow engine is a fine trade -- but "slow" still has to end. A wedged
+        # engine here would hold this request open indefinitely.
+        budget = stall_budget(text, spec)
+        try:
+            result = subprocess.run(
+                render(spec["save"], out=str(out), **spec),
+                input=text.encode(), capture_output=True, timeout=budget,
+            )
+        except subprocess.TimeoutExpired:
+            out.unlink(missing_ok=True)
+            raise RuntimeError(
+                f"save timed out after {budget:.0f}s. Raise startup_grace for this "
+                f"engine if it is merely slow to load its model."
+            ) from None
         if result.returncode != 0 or not out.exists():
             err = result.stderr.decode("utf-8", "replace")[:400]
             raise RuntimeError(f"save failed: {err or 'no output produced'}")
