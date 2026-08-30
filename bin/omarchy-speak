@@ -42,6 +42,11 @@ DEFAULT_CONFIG = {
     "save_dir": "~/Audio/speak",
     # True: ask where to save. False: write straight to save_dir.
     "save_prompt": True,
+    # Speaking the selection falls back to the clipboard when no selection
+    # exists. See SelectionFallback for why, and for what stops it speaking
+    # something an hour old. False restricts /speak/selection to the primary
+    # selection and nothing else.
+    "selection_fallback": True,
     "max_chars": 20000,
     "engines": {
         # mode "stream": engine writes raw audio to stdout, piped straight to
@@ -104,7 +109,11 @@ def write_default_config() -> Path:
 
 
 def read_selection(primary: bool) -> str:
-    """Read the Wayland primary selection or clipboard."""
+    """Read the Wayland primary selection or clipboard.
+
+    Empty string when nothing is set: wl-paste exits non-zero on an empty
+    selection, which is a normal state here and not an error.
+    """
     cmd = ["wl-paste", "--no-newline"]
     if primary:
         cmd.append("--primary")
@@ -113,6 +122,69 @@ def read_selection(primary: bool) -> str:
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise RuntimeError(f"wl-paste failed: {exc}") from exc
     return out.stdout.decode("utf-8", "replace").strip()
+
+
+class SelectionFallback:
+    """Reads the selection, falling back to the clipboard when there is none.
+
+    The primary selection is system-wide only for applications that leave the
+    mouse to the terminal or the toolkit. A TUI that turns on mouse reporting
+    takes the drag for itself -- herdr with `mouse_capture = true`, tmux with
+    `set -g mouse on`, nvim with `mouse=a` -- so the compositor never sees a
+    selection at all and `wl-paste --primary` returns whatever some other
+    window last set, or nothing.
+
+    Those applications do still copy. They copy with OSC 52, whose target is
+    the clipboard rather than the primary selection: herdr emits `]52;c` and
+    contains no `]52;p` anywhere. So an empty primary selection is the signal
+    that we are inside such an application, and the clipboard is where its
+    copy actually went.
+
+    The risk of falling back is speaking something stale, because "nothing is
+    selected" and "nothing was selected but something was copied an hour ago"
+    look identical from here. Two things bound it:
+
+      - the fallback runs only when the primary selection is EMPTY, so it can
+        never override a real selection; and
+      - the same clipboard text is never handed out twice, so holding the key
+        down in a terminal that sets no selection reads the clipboard once and
+        then reports nothing to speak, instead of repeating an hour-old copy.
+
+    Asking for the clipboard BY NAME is not a fallback and is not guarded:
+    /speak/clipboard always speaks it, however recently it was last spoken.
+    That is the way to deliberately repeat something.
+    """
+
+    def __init__(self, enabled: bool = True):
+        self.enabled = enabled
+        # The last text the fallback handed out -- not the last text spoken.
+        # Requests are served on threads, so it is locked.
+        self._last: str | None = None
+        self._lock = threading.Lock()
+
+    def read(self, source: str) -> tuple[str, str]:
+        """Returns the text and the source it actually came from.
+
+        The second value differs from `source` exactly when the fallback
+        fired, which is the only way a caller can tell that it did.
+        """
+        if source != "primary":
+            return read_selection(primary=False), source
+
+        text = read_selection(primary=True)
+        if text:
+            return text, "primary"
+        if not self.enabled:
+            return "", "primary"
+
+        clipboard = read_selection(primary=False)
+        if not clipboard:
+            return "", "primary"
+        with self._lock:
+            if clipboard == self._last:
+                return "", "primary"
+            self._last = clipboard
+        return clipboard, "clipboard"
 
 
 def render(template: list[str], **fields) -> list[str]:
@@ -449,6 +521,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, {
                 "save_dir": cfg["save_dir"],
                 "save_prompt": cfg.get("save_prompt", True),
+                "selection_fallback": self.server.selection.enabled,
                 "default_engine": cfg["default_engine"],
             })
         elif self.path == "/engines":
@@ -492,14 +565,15 @@ class Handler(BaseHTTPRequestHandler):
             self._send(500, {"error": f"{type(exc).__name__}: {exc}"})
 
     # -- actions ----------------------------------------------------------
-    def _resolve(self, body: dict, source: str | None) -> tuple[str, str, dict]:
+    def _resolve(self, body: dict, source: str | None) -> tuple[str, str, dict, str]:
         cfg = self.server.config
+        used = source or "text"
         if source:
-            text = read_selection(primary=(source == "primary"))
+            text, used = self.server.selection.read(source)
         else:
             text = (body.get("text") or "").strip()
         if not text:
-            raise RuntimeError(f"nothing to speak ({source or 'text'} was empty)")
+            raise RuntimeError(self._nothing_to_speak(source))
         text = text[: cfg["max_chars"]]
 
         engine = body.get("engine") or cfg["default_engine"]
@@ -509,7 +583,29 @@ class Handler(BaseHTTPRequestHandler):
         missing = self._missing_binaries(spec)
         if missing:
             raise RuntimeError(f"{engine}: missing binaries: {', '.join(missing)}")
-        return text, engine, spec
+        return text, engine, spec, used
+
+    def _nothing_to_speak(self, source: str | None) -> str:
+        """Says what to do about it, not just that it happened.
+
+        An empty primary selection is the one failure here with a non-obvious
+        cause, and it is the common one: a mouse-capturing TUI never sets a
+        selection, so this reads as "the keybind is broken" rather than as
+        "there is nothing selected". Name the cause in the message, because
+        the journal is where anyone will look first.
+        """
+        if source == "primary":
+            if not self.server.selection.enabled:
+                return ("nothing to speak: no primary selection, and "
+                        "selection_fallback is off")
+            return (
+                "nothing to speak: no primary selection, and the clipboard "
+                "held nothing new. A terminal application that captures the "
+                "mouse (herdr, tmux, nvim) sets no selection -- hold Shift "
+                "while dragging to select with the terminal instead, or copy "
+                "and use /speak/clipboard."
+            )
+        return f"nothing to speak ({source or 'text'} was empty)"
 
     @staticmethod
     def _missing_binaries(spec: dict) -> list[str]:
@@ -521,13 +617,14 @@ class Handler(BaseHTTPRequestHandler):
         return sorted(set(missing))
 
     def _speak(self, body: dict, source: str | None = None) -> None:
-        text, engine, spec = self._resolve(body, source)
+        text, engine, spec, used = self._resolve(body, source)
         self.server.player.speak(text, engine, spec)
-        self._send(200, {"ok": True, "engine": engine, "chars": len(text)})
+        self._send(200, {"ok": True, "engine": engine, "chars": len(text),
+                         "source": used})
 
     def _save(self, body: dict) -> None:
         cfg = self.server.config
-        text, engine, spec = self._resolve(body, body.get("source"))
+        text, engine, spec, used = self._resolve(body, body.get("source"))
         if "save" not in spec:
             raise RuntimeError(f"engine {engine!r} has no save command")
 
@@ -547,7 +644,7 @@ class Handler(BaseHTTPRequestHandler):
             err = result.stderr.decode("utf-8", "replace")[:400]
             raise RuntimeError(f"save failed: {err or 'no output produced'}")
         self._send(200, {"ok": True, "engine": engine, "path": str(out),
-                         "bytes": out.stat().st_size})
+                         "bytes": out.stat().st_size, "source": used})
 
     def _stop(self, body: dict) -> None:
         self._send(200, {"ok": True, "stopped": self.server.player.stop()})
@@ -557,18 +654,19 @@ class Handler(BaseHTTPRequestHandler):
         if self.server.player.stop():
             self._send(200, {"ok": True, "action": "stopped"})
             return
-        text, engine, spec = self._resolve(body, "primary")
+        text, engine, spec, used = self._resolve(body, "primary")
         self.server.player.speak(text, engine, spec)
-        self._send(200, {"ok": True, "action": "speaking", "engine": engine})
+        self._send(200, {"ok": True, "action": "speaking", "engine": engine,
+                         "source": used})
 
     def _enqueue(self, body: dict, source: str | None = None) -> None:
         if source is None:
             # Literal text wins; otherwise queueing means the selection.
             source = body.get("source") or (None if body.get("text") else "primary")
-        text, engine, spec = self._resolve(body, source)
+        text, engine, spec, used = self._resolve(body, source)
         result = self.server.player.enqueue(Clip(text, engine, spec))
         self._send(200, {"ok": True, "engine": engine, "chars": len(text),
-                         **result})
+                         "source": used, **result})
 
     def _clear(self, body: dict) -> None:
         self._send(200, {"ok": True, "dropped": self.server.player.clear()})
@@ -582,9 +680,10 @@ class Handler(BaseHTTPRequestHandler):
         if player.pause():
             self._send(200, {"ok": True, "action": "paused"})
             return
-        text, engine, spec = self._resolve(body, "primary")
+        text, engine, spec, used = self._resolve(body, "primary")
         player.speak(text, engine, spec)
-        self._send(200, {"ok": True, "action": "speaking", "engine": engine})
+        self._send(200, {"ok": True, "action": "speaking", "engine": engine,
+                         "source": used})
 
     def _pause(self, body: dict) -> None:
         self._send(200, {"ok": True, "paused": self.server.player.pause()})
@@ -631,6 +730,7 @@ def main() -> int:
     server.daemon_threads = True
     server.config = cfg
     server.player = Player()
+    server.selection = SelectionFallback(cfg.get("selection_fallback", True))
     server.verbose = "--verbose" in args or "-v" in args
 
     def shutdown(signum, frame):

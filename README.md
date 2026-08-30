@@ -7,7 +7,9 @@ hear it. Two engines: **piper** for instant playback, **kokoro** when the voice 
 more than the latency.
 
 No browser extension. On Wayland the *primary selection* is system-wide, so one keybind
-covers every application at once.
+covers every application at once — including terminal applications that never set a
+selection, which fall back to the clipboard. See
+[Terminal applications](#terminal-applications-herdr-tmux-nvim).
 
 ## Features
 
@@ -267,6 +269,55 @@ The chooser is `omarchy-speak-picker`, a GTK4 `FileDialog` that routes through
 configured for. If GTK bindings are missing it exits 2 and the save falls back
 to `save_dir` rather than failing.
 
+## Terminal applications (herdr, tmux, nvim)
+
+Highlighting text inside a mouse-capturing TUI does **not** set the primary selection,
+so a naive `wl-paste --primary` reads whatever some other window last set, or nothing.
+Two things cause it, and both have to be true:
+
+1. **The application takes the mouse.** herdr with `mouse_capture = true`, tmux with
+   `set -g mouse on`, nvim with `mouse=a` all enable mouse reporting (`\e[?1002h`,
+   `\e[?1003h`, `\e[?1006h`). The terminal then forwards drags to the application
+   instead of making its own selection, and only the *terminal* publishes to the
+   Wayland primary selection.
+2. **When they do copy, they copy elsewhere.** They use OSC 52, whose target is the
+   clipboard rather than the primary selection — herdr emits `\e]52;c` and contains
+   no `\e]52;p` at all.
+
+So **speaking the selection falls back to the clipboard when there is no selection.**
+An empty primary selection is a reliable signal that you are inside such an
+application, and the clipboard is where its copy actually went.
+
+The risk is speaking something stale, because "nothing is selected" and "nothing is
+selected but something was copied an hour ago" look identical from outside. Two bounds:
+
+- the fallback runs **only when the primary selection is empty**, so it can never
+  override a real selection; and
+- the same clipboard text is **never handed out twice**, so leaning on `SUPER+R` in a
+  terminal that sets no selection reads the clipboard once and then tells you there is
+  nothing to speak, rather than repeating an hour-old copy on every press.
+
+Asking for the clipboard by name is not a fallback and is not guarded: `SUPER+ALT+R`
+(`/speak/clipboard`) always speaks it, which is how you deliberately repeat something.
+
+Every reply reports the `source` it actually used, so which path fired is visible
+rather than guessed at:
+
+```console
+$ curl -s -X POST localhost:8765/speak/selection
+{"ok": true, "engine": "piper", "chars": 214, "source": "clipboard"}
+```
+
+Set `"selection_fallback": false` in the config to switch it off and restrict
+`/speak/selection` to the primary selection alone.
+
+**Selecting with the terminal instead.** If you would rather have the real primary
+selection, hold **Shift** while dragging. That overrides the application's mouse grab
+and lets the terminal make the selection itself. In foot that is
+`selection-override-modifiers`, which defaults to `Shift` (`man 5 foot.ini`); alacritty,
+kitty and ghostty follow the same Shift convention, though check your own config if you
+have rebound it.
+
 ## Configuration
 
 `~/.config/omarchy-speak/config.json`, created on first run with `--init-config`.
@@ -295,6 +346,10 @@ packaging you used — pip, AUR, a local build — without code changes. `{model
 player — speech starts before synthesis finishes) or `file` (engine renders a wav,
 then it plays).
 
+`selection_fallback` (default `true`) controls whether speaking the selection falls
+back to the clipboard when nothing is selected — see
+[Terminal applications](#terminal-applications-herdr-tmux-nvim).
+
 ## HTTP API
 
 The daemon listens on `127.0.0.1:8765`. Any client can drive it — the keybinds are
@@ -306,10 +361,10 @@ just `curl` in a trenchcoat.
 | `GET` | `/engines` | | Configured engines |
 | `GET` | `/queue` | | The queue, and which clip is current |
 | `POST` | `/speak` | `{"text":…, "engine":…}` | Speak literal text, replacing the queue |
-| `POST` | `/speak/selection` | `{"engine":…}` | Speak the primary selection |
+| `POST` | `/speak/selection` | `{"engine":…}` | Speak the primary selection, or the clipboard if there is none |
 | `POST` | `/speak/clipboard` | `{"engine":…}` | Speak the clipboard |
 | `POST` | `/queue` | `{"text":…, "engine":…}` | Append text to the queue |
-| `POST` | `/queue/selection` | `{"engine":…}` | Append the primary selection |
+| `POST` | `/queue/selection` | `{"engine":…}` | Append the primary selection, or the clipboard if there is none |
 | `POST` | `/queue/clipboard` | `{"engine":…}` | Append the clipboard |
 | `POST` | `/queue/clear` | | Drop everything except what is playing |
 | `POST` | `/playpause` | `{"engine":…}` | Resume, or pause, or start on the selection |
