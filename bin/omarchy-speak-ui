@@ -87,6 +87,16 @@ def describe(voice: str) -> str:
     return ""
 
 
+def ctl_supports(verb: str) -> bool:
+    """Whether the installed omarchy-speak-ctl knows a verb."""
+    try:
+        out = subprocess.run(["omarchy-speak-ctl", "--help"],
+                             capture_output=True, text=True, timeout=10)
+        return any(line.strip().startswith(verb) for line in out.stdout.splitlines())
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 def read_config() -> dict:
     try:
         return json.loads(CONFIG.read_text())
@@ -226,7 +236,9 @@ class App:
         self.current = cfg.get("voice", "af_sarah")
         self.speed = float(cfg.get("speed", 1.0))
         self.saved = f"{self.current} @ {self.speed:.2f}"
-        self.status = "enter audition   w save   r reset   q quit"
+        self.has_reset = ctl_supports("reset")
+        self.status = ("enter audition   w save   r reset   q quit" if self.has_reset
+                       else "enter audition   w save   q quit")
         self.meter = Meter()
         self.audition = Auditioner()
         if self.current in self.visible():
@@ -399,6 +411,15 @@ class App:
         self.status = f"saved {voice} @ {self.speed:.2f}"
 
     def reset(self) -> None:
+        """Hand off to `omarchy-speak-ctl reset`, if this ctl has it.
+
+        An older ctl answers an unknown verb with its usage text and a zero
+        exit, which would land in the status line looking like a result. Ask
+        once whether the verb exists rather than trying to interpret that.
+        """
+        if not self.has_reset:
+            self.status = "reset needs a newer omarchy-speak-ctl"
+            return
         self.status = "resetting..."
         self.draw()
         out = subprocess.run(["omarchy-speak-ctl", "reset"], capture_output=True, text=True)
