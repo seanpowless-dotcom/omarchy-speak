@@ -30,7 +30,7 @@ o.bind("SUPER + BRACKETLEFT", "Speak: previous in queue", "omarchy-speak-ctl pre
 
 -- Render the selection to an audio file. Opens a file chooser unless
 -- save_prompt is false in the config; pass a path to always skip the chooser.
-o.bind("SUPER + SHIFT + ALT + R", "Save selection as audio", "omarchy-speak-ctl save kokoro")
+o.bind("SUPER + SHIFT + ALT + R", "Save selection as audio", "omarchy-speak-ctl save")
 
 -- Hard stop: silences playback and empties the queue.
 o.bind("SUPER + SHIFT + ESCAPE", "Stop speaking", "omarchy-speak-ctl stop")

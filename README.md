@@ -3,9 +3,8 @@
 System-wide text-to-speech for [Omarchy](https://omarchy.org), driven by Hyprland keybinds.
 
 Highlight text anywhere — browser, terminal, PDF viewer, editor — and press a key to
-hear it. Two engines: **piper** streams from a single binary with no model to
-load, **kokoro** sounds markedly better and needs onnxruntime and a model. Which
-is actually faster depends on the machine — measure before assuming.
+hear it. Speech comes from **kokoro**, 54 voices across nine languages, running
+locally on CPU or CUDA.
 
 No browser extension. On Wayland the *primary selection* is system-wide, so one keybind
 covers every application at once — including terminal applications that never set a
@@ -38,39 +37,10 @@ selection, which fall back to the clipboard. See
 ## Requirements
 
 - Wayland with `wl-clipboard` (`wl-paste`)
-- An audio player: `aplay` (piper streaming) and/or `paplay`
-- At least one TTS engine: [piper](https://github.com/OHF-Voice/piper1-gpl),
-  [kokoro](https://huggingface.co/hexgrad/Kokoro-82M)
+- An audio player: `aplay` and/or `paplay`
+- [kokoro](https://huggingface.co/hexgrad/Kokoro-82M) and its model
 
-Installing piper and a voice:
-
-```bash
-uv tool install piper-tts
-uv tool run --from piper-tts python -m piper.download_voices \
-  en_US-lessac-medium --download-dir ~/.local/share/piper/voices
-```
-
-Then point `engines.piper.model` at the `.onnx` file, and set the `-r` value in
-`engines.piper.play` to the voice's sample rate (read it from the sidecar
-`.onnx.json` under `audio.sample_rate`). `config.example.json` is a working
-piper setup you can copy.
-
-Installing kokoro (ONNX build, no torch):
-
-```bash
-uv venv --python 3.12 ~/.local/share/omarchy-speak/venv
-uv pip install --python ~/.local/share/omarchy-speak/venv/bin/python \
-  kokoro-onnx soundfile
-
-M=~/.local/share/omarchy-speak/models; mkdir -p "$M"
-BASE=https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0
-curl -L -o "$M/kokoro-v1.0.onnx" "$BASE/kokoro-v1.0.onnx"   # 311 MB
-curl -L -o "$M/voices-v1.0.bin"  "$BASE/voices-v1.0.bin"    # 27 MB
-
-install -Dm755 bin/omarchy-speak-kokoro ~/.local/bin/omarchy-speak-kokoro
-```
-
-`bin/omarchy-speak-kokoro` wraps the library in a piper-shaped CLI, so both
+`bin/omarchy-speak-kokoro` wraps the library in a CLI the daemon drives as a
 engines are configured the same way. `--list-voices` prints the 50-odd
 available voices.
 
@@ -193,14 +163,13 @@ o.bind("SUPER + ALT + R", "Speak clipboard", "omarchy-speak-ctl clipboard")
 o.bind("SUPER + SHIFT + BRACKETRIGHT", "Queue selection", "omarchy-speak-ctl enqueue")
 o.bind("SUPER + BRACKETRIGHT", "Speak: next in queue", "omarchy-speak-ctl next")
 o.bind("SUPER + BRACKETLEFT", "Speak: previous in queue", "omarchy-speak-ctl prev")
-o.bind("SUPER + SHIFT + ALT + R", "Save selection as audio", "omarchy-speak-ctl save kokoro")
+o.bind("SUPER + SHIFT + ALT + R", "Save selection as audio", "omarchy-speak-ctl save")
 o.bind("SUPER + SHIFT + ESCAPE", "Stop speaking", "omarchy-speak-ctl stop")
 ```
 
-`save` names kokoro explicitly on purpose: nothing waits on a render to a file,
-so the artifact gets the better voice even on a machine where the faster engine
-is the default. Speaking does not name an engine, so it follows
-`default_engine`.
+No binding names an engine: with one configured they all follow
+`default_engine`. Pass one to `omarchy-speak-ctl` explicitly if you ever add a
+second.
 
 Then `hyprctl reload`. On plain Hyprland without Omarchy's Lua layer, the
 equivalent `bindd =` lines go in `hyprland.conf`:
@@ -398,8 +367,8 @@ Passing an explicit path to `omarchy-speak-ctl save` skips the chooser either
 way, so you can bind one key that asks and another that does not:
 
 ```lua
-o.bind("SUPER + SHIFT + ALT + R", "Save selection as audio", "omarchy-speak-ctl save kokoro")
-o.bind("SUPER + CTRL + ALT + S", "Save selection (no prompt)", "omarchy-speak-ctl save kokoro ~/Audio/speak/quick.wav")
+o.bind("SUPER + SHIFT + ALT + R", "Save selection as audio", "omarchy-speak-ctl save")
+o.bind("SUPER + CTRL + ALT + S", "Save selection (no prompt)", "omarchy-speak-ctl save ~/Audio/speak/quick.wav")
 ```
 
 The chooser is `omarchy-speak-picker`, a GTK4 `FileDialog` that routes through
@@ -443,7 +412,7 @@ rather than guessed at:
 
 ```console
 $ curl -s -X POST localhost:8765/speak/selection
-{"ok": true, "engine": "piper", "chars": 214, "source": "clipboard"}
+{"ok": true, "engine": "kokoro", "chars": 214, "source": "clipboard"}
 ```
 
 Set `"selection_fallback": false` in the config to switch it off and restrict
@@ -509,7 +478,6 @@ engine overrides it, because measurement says neither needs to:
 | kokoro, CUDA | 0.56 s |
 | kokoro, warm, i7-8550U no CUDA | 1.3 s |
 | kokoro, **worker stopped**, same machine | 2.2 s |
-| piper, same machine | 1.4–1.6 s |
 
 The 30-second default covers the worst of those more than ten times over.
 
@@ -548,15 +516,21 @@ packaging you used — pip, AUR, a local build — without code changes. `{model
 
 ```json
 {
-  "default_engine": "piper",
+  "default_engine": "kokoro",
   "save_dir": "~/Audio/speak",
   "engines": {
-    "piper": {
+    "kokoro": {
       "mode": "stream",
-      "model": "/path/to/en_US-lessac-medium.onnx",
-      "speak": ["piper", "--model", "{model}", "--output-raw"],
-      "save":  ["piper", "--model", "{model}", "--output_file", "{out}"],
-      "play":  ["aplay", "-q", "-r", "22050", "-f", "S16_LE", "-t", "raw", "-"]
+      "voice": "af_sarah",
+      "speed": 1.0,
+      "chunk_chars": 350,
+      "speak": ["omarchy-speak-kokoro", "--voice", "{voice}",
+                "--speed", "{speed}", "--chunk-chars", "{chunk_chars}",
+                "--output-raw"],
+      "save":  ["omarchy-speak-kokoro", "--voice", "{voice}",
+                "--speed", "{speed}", "--chunk-chars", "{chunk_chars}",
+                "--output-file", "{out}"],
+      "play":  ["aplay", "-q", "-r", "24000", "-f", "S16_LE", "-t", "raw", "-"]
     }
   }
 }
@@ -565,6 +539,12 @@ packaging you used — pip, AUR, a local build — without code changes. `{model
 `mode` is either `stream` (engine writes raw audio to stdout, piped straight to the
 player — speech starts before synthesis finishes) or `file` (engine renders a wav,
 then it plays).
+
+**Every tunable has to appear in the command template.** `render()` substitutes
+`{placeholders}` from the engine block, so a key the template never names is
+written to the config, reported as saved, and ignored by everything downstream.
+That is why `{speed}` and `{chunk_chars}` are in the commands above and not just
+in the block.
 
 `selection_fallback` (default `true`) controls whether speaking the selection falls
 back to the clipboard when nothing is selected — see
