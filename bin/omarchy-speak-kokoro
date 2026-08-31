@@ -152,18 +152,49 @@ def to_pcm16(samples) -> bytes:
     return (np.clip(samples, -1.0, 1.0) * 32767).astype("<i2").tobytes()
 
 
-async def _stream(kokoro, req: dict, write) -> None:
-    """Synthesise sentence by sentence, handing each chunk to `write`.
+async def _stream(kokoro, req: dict, write, lock=None) -> None:
+    """Synthesise chunk by chunk, handing each to `write`.
 
     `write` raises BrokenPipeError once the consumer is gone, which is how an
     interrupted utterance stops the model mid-passage instead of finishing it.
+
+    The lock is held for SYNTHESIS ONLY, never across `write`. It exists to
+    serialise one ONNX session, which is a property of generation; delivery to
+    a client has nothing to do with it. Holding it across the send was a
+    deadlock with a trigger anyone could pull:
+
+        pause SIGSTOPs aplay -> the client stops draining its socket
+        -> the socket buffer fills -> sendall blocks in here
+        -> and it blocks holding the lock every other request needs.
+
+    One paused clip then wedged the worker for everything, silently, at ~0%
+    CPU, until someone restarted it. Reproduced deliberately before this
+    change: a probe that took 508ms healthy took 20s and returned nothing with
+    a clip paused.
+
+    A whole chunk is buffered before sending, so the lock is held for one
+    chunk's synthesis rather than for the whole utterance. That costs a little
+    time-to-first-audio -- the first chunk must finish generating rather than
+    its first batch -- which is what chunk_chars already tunes.
     """
     for chunk in chunk_text(req["text"], req.get("chunk_chars") or MAX_CHUNK_CHARS):
-        stream = kokoro.create_stream(
-            chunk, voice=req["voice"], speed=req["speed"], lang=req["lang"]
-        )
-        async for samples, _rate in stream:
-            write(to_pcm16(samples))
+        batches = []
+        if lock is not None:
+            lock.acquire()
+        try:
+            stream = kokoro.create_stream(
+                chunk, voice=req["voice"], speed=req["speed"], lang=req["lang"]
+            )
+            async for samples, _rate in stream:
+                batches.append(to_pcm16(samples))
+        finally:
+            if lock is not None:
+                lock.release()
+
+        # Outside the lock: a client that has stopped reading now blocks only
+        # itself, and every other caller is served while it sits there.
+        for pcm in batches:
+            write(pcm)
 
 
 def synth_to_file(kokoro, req: dict) -> None:
@@ -208,12 +239,15 @@ def serve(args) -> int:
                     buf += part
                 req = json.loads(buf)
 
-                with lock:
-                    if req.get("output_file"):
+                if req.get("output_file"):
+                    # A file render never touches the client until it is done,
+                    # so holding the lock across it blocks nobody unexpectedly.
+                    with lock:
                         synth_to_file(kokoro, req)
-                        conn.sendall(b'{"ok":true}\n')
-                    else:
-                        asyncio.run(_stream(kokoro, req, conn.sendall))
+                    conn.sendall(b'{"ok":true}\n')
+                else:
+                    # Streaming takes the lock per chunk, inside _stream.
+                    asyncio.run(_stream(kokoro, req, conn.sendall, lock))
             except (BrokenPipeError, ConnectionResetError):
                 pass  # client interrupted; drop this utterance
             except Exception as exc:  # noqa: BLE001 - report, never die
