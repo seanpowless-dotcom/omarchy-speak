@@ -1,0 +1,433 @@
+#!/usr/bin/env python3
+"""omarchy-speak-ui — a small curses console for choosing a voice.
+
+Arrows and the mouse both work. Language across the top, voices down the left,
+the selected voice and speed on the right, and a level meter along the bottom.
+
+The meter reads the OUTPUT SINK, not the synthesiser. That distinction is the
+whole reason it exists: a meter fed from the engine bounces happily while a
+Bluetooth speaker that is connected but asleep swallows every sample, which is a
+failure that has cost real hours. Fed from the sink's monitor, a flat bar during
+playback means no sound is reaching the world, and that is worth knowing.
+
+Stdlib only, like the daemon. Talks to it over the same loopback HTTP the
+keybinds use, and tests voices by driving the engine directly so that auditioning
+one does not disturb whatever the daemon is doing.
+"""
+
+from __future__ import annotations
+
+import curses
+import json
+import os
+import shutil
+import struct
+import subprocess
+import threading
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+HOST = os.environ.get("OMARCHY_SPEAK_HOST", "127.0.0.1")
+PORT = os.environ.get("OMARCHY_SPEAK_PORT", "8765")
+BASE = f"http://{HOST}:{PORT}"
+
+CONFIG = Path(os.environ.get("OMARCHY_SPEAK_CONFIG",
+                             "~/.config/omarchy-speak/config.json")).expanduser()
+CACHE = Path(os.environ.get("XDG_CACHE_HOME", "~/.cache")).expanduser() / "omarchy-speak"
+VOICE_CACHE = CACHE / "voices.txt"
+
+SAMPLE = "The quick brown fox jumps over the lazy dog."
+
+# Kokoro encodes language and gender in the voice name: first letter language,
+# second gender. Nothing else about a voice is knowable without hearing it,
+# which is why this has a test key and no written descriptions.
+LANGS = {
+    "a": "American", "b": "British", "e": "Spanish", "f": "French",
+    "h": "Hindi", "i": "Italian", "j": "Japanese", "p": "Portuguese",
+    "z": "Chinese",
+}
+GENDER = {"f": "female", "m": "male"}
+
+
+# ── data ────────────────────────────────────────────────────────────────────
+def http(method: str, path: str, body: dict | None = None, timeout: float = 10):
+    req = urllib.request.Request(
+        BASE + path, method=method,
+        data=json.dumps(body).encode() if body is not None else None,
+        headers={"Content-Type": "application/json"} if body is not None else {})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.load(r)
+
+
+def load_voices(refresh: bool = False) -> list[str]:
+    """Voice names, cached because listing them loads the model.
+
+    The list is a property of the model file, so it only changes when that does.
+    """
+    if not refresh and VOICE_CACHE.is_file():
+        names = [x.strip() for x in VOICE_CACHE.read_text().splitlines() if x.strip()]
+        if names:
+            return names
+    out = subprocess.run(["omarchy-speak-kokoro", "--list-voices"],
+                         capture_output=True, text=True, timeout=180)
+    names = [l.strip() for l in out.stdout.splitlines()
+             if l.strip() and "_" in l and " " not in l.strip()]
+    if names:
+        CACHE.mkdir(parents=True, exist_ok=True)
+        VOICE_CACHE.write_text("\n".join(names) + "\n")
+    return names
+
+
+def describe(voice: str) -> str:
+    prefix = voice.split("_")[0] if "_" in voice else ""
+    if len(prefix) == 2:
+        return f"{LANGS.get(prefix[0], '?')} {GENDER.get(prefix[1], '')}".strip()
+    return ""
+
+
+def read_config() -> dict:
+    try:
+        return json.loads(CONFIG.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def write_engine_setting(key: str, value) -> None:
+    """Persist one kokoro setting, leaving the rest of the file alone."""
+    cfg = read_config()
+    cfg.setdefault("engines", {}).setdefault("kokoro", {})[key] = value
+    CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG.write_text(json.dumps(cfg, indent=2) + "\n")
+
+
+# ── level meter ─────────────────────────────────────────────────────────────
+class Meter:
+    """RMS of the default sink's monitor, 0.0-1.0, updated in a thread.
+
+    Reads the sink rather than the engine deliberately; see the module docstring.
+    Silently stays at zero if parec is unavailable, because a missing meter must
+    not stop anyone choosing a voice.
+    """
+
+    def __init__(self) -> None:
+        self.level = 0.0
+        self.available = shutil.which("parec") is not None
+        self._stop = threading.Event()
+        self._proc: subprocess.Popen | None = None
+        if self.available:
+            threading.Thread(target=self._run, daemon=True).start()
+
+    def _monitor_source(self) -> str | None:
+        try:
+            sink = subprocess.run(["pactl", "get-default-sink"],
+                                  capture_output=True, text=True, timeout=5).stdout.strip()
+            return f"{sink}.monitor" if sink else None
+        except (OSError, subprocess.SubprocessError):
+            return None
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            source = self._monitor_source()
+            if not source:
+                time.sleep(2)
+                continue
+            try:
+                self._proc = subprocess.Popen(
+                    ["parec", f"--device={source}", "--format=s16le",
+                     "--rate=8000", "--channels=1", "--latency-msec=50"],
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            except OSError:
+                self.available = False
+                return
+            try:
+                while not self._stop.is_set():
+                    chunk = self._proc.stdout.read(800)  # ~100ms
+                    if not chunk:
+                        break
+                    n = len(chunk) // 2
+                    if not n:
+                        continue
+                    vals = struct.unpack(f"<{n}h", chunk[: n * 2])
+                    rms = (sum(v * v for v in vals) / n) ** 0.5 / 32768.0
+                    # Decay slowly, rise instantly: a meter that drops as fast as
+                    # it climbs reads as flicker rather than as level.
+                    self.level = max(rms * 3.0, self.level * 0.7)
+            except (OSError, struct.error):
+                pass
+            finally:
+                if self._proc and self._proc.poll() is None:
+                    self._proc.kill()
+            # The sink changes when a device appears or sleeps; re-resolve it.
+            time.sleep(1)
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._proc and self._proc.poll() is None:
+            self._proc.kill()
+
+
+# ── audition ────────────────────────────────────────────────────────────────
+class Auditioner:
+    """Plays a sample through the engine directly, bypassing the daemon.
+
+    Auditioning a voice must not disturb what the daemon is doing, and the voice
+    being auditioned is by definition not the configured one, so this drives
+    the engine itself rather than asking the daemon to speak.
+    """
+
+    def __init__(self) -> None:
+        self.procs: list[subprocess.Popen] = []
+        self.error = ""
+
+    def stop(self) -> None:
+        for p in reversed(self.procs):
+            if p.poll() is None:
+                p.kill()
+        self.procs = []
+
+    def play(self, voice: str, speed: float) -> None:
+        self.stop()
+        self.error = ""
+        try:
+            tts = subprocess.Popen(
+                ["omarchy-speak-kokoro", "--voice", voice, "--speed", f"{speed:.2f}",
+                 "--output-raw"],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            play = subprocess.Popen(
+                ["aplay", "-q", "-r", "24000", "-f", "S16_LE", "-t", "raw", "-"],
+                stdin=tts.stdout, stderr=subprocess.DEVNULL)
+            tts.stdout.close()
+
+            def feed() -> None:
+                try:
+                    tts.stdin.write(SAMPLE.encode())
+                    tts.stdin.close()
+                except (BrokenPipeError, ValueError):
+                    pass
+
+            threading.Thread(target=feed, daemon=True).start()
+            self.procs = [tts, play]
+        except OSError as exc:
+            self.error = str(exc)
+
+
+# ── ui ──────────────────────────────────────────────────────────────────────
+class App:
+    def __init__(self, stdscr, voices: list[str]) -> None:
+        self.scr = stdscr
+        self.all_voices = voices
+        self.langs = ["all"] + sorted({v[0] for v in voices if "_" in v})
+        self.lang_i = 0
+        self.voice_i = 0
+        self.top = 0
+        cfg = read_config().get("engines", {}).get("kokoro", {})
+        self.current = cfg.get("voice", "af_sarah")
+        self.speed = float(cfg.get("speed", 1.0))
+        self.saved = f"{self.current} @ {self.speed:.2f}"
+        self.status = "enter audition   w save   r reset   q quit"
+        self.meter = Meter()
+        self.audition = Auditioner()
+        if self.current in self.visible():
+            self.voice_i = self.visible().index(self.current)
+
+    def visible(self) -> list[str]:
+        lang = self.langs[self.lang_i]
+        if lang == "all":
+            return self.all_voices
+        return [v for v in self.all_voices if v.startswith(lang)]
+
+    def selected(self) -> str:
+        vis = self.visible()
+        return vis[self.voice_i] if vis else ""
+
+    # -- drawing ---------------------------------------------------------
+    def draw(self) -> None:
+        scr = self.scr
+        scr.erase()
+        h, w = scr.getmaxyx()
+        if h < 10 or w < 50:
+            scr.addstr(0, 0, "terminal too small"[: w - 1])
+            scr.refresh()
+            return
+
+        scr.addstr(0, 1, "omarchy-speak", curses.A_BOLD)
+        scr.addstr(0, max(16, w - len(self.saved) - 8), f"default {self.saved}"[: w - 2],
+                   curses.A_DIM)
+
+        # language row
+        x = 1
+        for i, lang in enumerate(self.langs):
+            label = "all" if lang == "all" else LANGS.get(lang, lang)
+            cell = f" {label} "
+            if x + len(cell) >= w - 1:
+                break
+            attr = curses.A_REVERSE if i == self.lang_i else curses.A_NORMAL
+            scr.addstr(1, x, cell, attr)
+            x += len(cell) + 1
+
+        list_h = h - 5
+        vis = self.visible()
+        if self.voice_i >= len(vis):
+            self.voice_i = max(0, len(vis) - 1)
+        if self.voice_i < self.top:
+            self.top = self.voice_i
+        elif self.voice_i >= self.top + list_h:
+            self.top = self.voice_i - list_h + 1
+
+        split = min(24, w // 2)
+        for row in range(list_h):
+            idx = self.top + row
+            if idx >= len(vis):
+                break
+            name = vis[idx]
+            mark = "*" if name == self.current else " "
+            attr = curses.A_REVERSE if idx == self.voice_i else curses.A_NORMAL
+            scr.addstr(3 + row, 1, f"{mark}{name}".ljust(split - 2)[: split - 2], attr)
+
+        # detail pane
+        sel = self.selected()
+        if sel:
+            dx = split + 1
+            scr.addstr(3, dx, sel[: w - dx - 1], curses.A_BOLD)
+            scr.addstr(4, dx, describe(sel)[: w - dx - 1], curses.A_DIM)
+            scr.addstr(6, dx, f"speed  {self.speed:4.2f}   - / +"[: w - dx - 1])
+            if sel == self.current:
+                scr.addstr(8, dx, "this is the default"[: w - dx - 1], curses.A_DIM)
+            if self.audition.error:
+                scr.addstr(10, dx, self.audition.error[: w - dx - 1])
+
+        # level meter
+        self.draw_meter(h - 2, w)
+        scr.addstr(h - 1, 1, self.status[: w - 2], curses.A_DIM)
+        scr.refresh()
+
+    def draw_meter(self, row: int, w: int) -> None:
+        label = "level " if self.meter.available else "level (parec missing) "
+        width = max(0, w - len(label) - 3)
+        filled = int(min(1.0, self.meter.level) * width) if self.meter.available else 0
+        bar = "█" * filled + "─" * (width - filled)
+        try:
+            self.scr.addstr(row, 1, label, curses.A_DIM)
+            self.scr.addstr(row, 1 + len(label), bar[:width])
+        except curses.error:
+            pass  # bottom-right cell; harmless
+
+    # -- input -----------------------------------------------------------
+    def click(self, y: int, x: int) -> None:
+        if y == 1:
+            cx = 1
+            for i, lang in enumerate(self.langs):
+                label = "all" if lang == "all" else LANGS.get(lang, lang)
+                cell = len(f" {label} ")
+                if cx <= x < cx + cell:
+                    self.lang_i, self.voice_i, self.top = i, 0, 0
+                    return
+                cx += cell + 1
+        elif y >= 3:
+            idx = self.top + (y - 3)
+            if idx < len(self.visible()):
+                self.voice_i = idx
+                self.audition.play(self.selected(), self.speed)
+
+    def run(self) -> None:
+        self.scr.timeout(100)  # also paces the meter redraw
+        while True:
+            self.draw()
+            try:
+                key = self.scr.getch()
+            except KeyboardInterrupt:
+                break
+            if key == -1:
+                continue
+            if key in (ord("q"), 27):
+                break
+            elif key in (curses.KEY_DOWN, ord("j")):
+                self.voice_i = min(self.voice_i + 1, max(0, len(self.visible()) - 1))
+            elif key in (curses.KEY_UP, ord("k")):
+                self.voice_i = max(0, self.voice_i - 1)
+            elif key in (curses.KEY_NPAGE,):
+                self.voice_i = min(self.voice_i + 10, max(0, len(self.visible()) - 1))
+            elif key in (curses.KEY_PPAGE,):
+                self.voice_i = max(0, self.voice_i - 10)
+            elif key in (curses.KEY_RIGHT, ord("\t")):
+                self.lang_i = (self.lang_i + 1) % len(self.langs)
+                self.voice_i = self.top = 0
+            elif key == curses.KEY_LEFT:
+                self.lang_i = (self.lang_i - 1) % len(self.langs)
+                self.voice_i = self.top = 0
+            elif key in (ord("\n"), curses.KEY_ENTER, ord(" ")):
+                self.audition.play(self.selected(), self.speed)
+            elif key in (ord("+"), ord("=")):
+                self.speed = min(2.0, round(self.speed + 0.05, 2))
+            elif key in (ord("-"), ord("_")):
+                self.speed = max(0.5, round(self.speed - 0.05, 2))
+            elif key == ord("w"):
+                self.save()
+            elif key == ord("r"):
+                self.reset()
+            elif key == ord("R"):
+                self.status = "reloading voices..."
+                self.draw()
+                self.all_voices = load_voices(refresh=True)
+                self.status = "voices reloaded"
+            elif key == curses.KEY_MOUSE:
+                try:
+                    _, mx, my, _, _ = curses.getmouse()
+                    self.click(my, mx)
+                except curses.error:
+                    pass
+
+    def save(self) -> None:
+        """Persist the selection, then restart so the daemon picks it up.
+
+        The daemon reads its config once at startup, so a write alone changes
+        nothing that anyone can hear.
+        """
+        voice = self.selected()
+        if not voice:
+            return
+        write_engine_setting("voice", voice)
+        write_engine_setting("speed", self.speed)
+        self.current = voice
+        self.saved = f"{voice} @ {self.speed:.2f}"
+        self.status = "saved; restarting daemon..."
+        self.draw()
+        subprocess.run(["systemctl", "--user", "restart", "omarchy-speak"],
+                       capture_output=True)
+        self.status = f"saved {voice} @ {self.speed:.2f}"
+
+    def reset(self) -> None:
+        self.status = "resetting..."
+        self.draw()
+        out = subprocess.run(["omarchy-speak-ctl", "reset"], capture_output=True, text=True)
+        self.status = (out.stdout.strip().splitlines() or ["reset"])[-1][:120]
+
+
+def main() -> int:
+    voices = load_voices()
+    if not voices:
+        print("omarchy-speak-ui: could not list voices. Is omarchy-speak-kokoro "
+              "installed and its model present?")
+        return 1
+
+    def wrapped(stdscr):
+        curses.curs_set(0)
+        try:
+            curses.mousemask(curses.BUTTON1_CLICKED | curses.BUTTON1_PRESSED)
+        except curses.error:
+            pass
+        app = App(stdscr, voices)
+        try:
+            app.run()
+        finally:
+            app.meter.stop()
+            app.audition.stop()
+
+    curses.wrapper(wrapped)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
