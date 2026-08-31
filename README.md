@@ -20,10 +20,18 @@ selection, which fall back to the clipboard. See
 - **Play/pause** — a second press suspends mid-word; a third picks up where it left off
 - **A queue** — stack up clips as you find them and they read in turn, with
   forward and back
+- **Read a document** — a `.txt` or `.md` file, markdown stripped, queued by
+  section so the bracket keys become chapter navigation
+- **A voice picker** — 54 kokoro voices, auditioned in place, with speed and
+  chunk size adjustable and a level meter that reads the output sink
+- **A voice per source** — an utterance can name a voice, or a profile the
+  machine maps to one, so system, apps and agents can each sound different
 - **Two engines** — fast by default, high-quality on a modifier
 - **GPU** — kokoro runs on CUDA when a usable GPU is present, and falls back to
   the CPU when it isn't
 - **Streaming** — both engines start speaking before synthesis finishes
+- **Says when it is broken** — a stalled clip is killed and explained rather
+  than left running, and `reset` writes a diagnostic report before restarting
 
 ## Requirements
 
@@ -199,7 +207,7 @@ Check for conflicts before committing to keys — on Omarchy,
 | Key | Action |
 | --- | --- |
 | `SUPER + R` | Speak selection — press again to pause, again to resume |
-| `SUPER + SHIFT + R` | Speak selection with kokoro |
+| `SUPER + SHIFT + R` | Voice picker |
 | `SUPER + ALT + R` | Speak clipboard |
 | `SUPER + SHIFT + ]` | Queue the selection behind what's playing |
 | `SUPER + ]` | Next clip in the queue |
@@ -207,11 +215,130 @@ Check for conflicts before committing to keys — on Omarchy,
 | `SUPER + SHIFT + ALT + R` | Save selection to audio |
 | `SUPER + SHIFT + ESC` | Stop, and empty the queue |
 
+`SUPER+SHIFT+R` used to force the kokoro engine, which is a no-op wherever
+kokoro is already the default — the same engine and the same result as
+`SUPER+R`, one keybind spent on nothing. It opens the picker instead. Pass an
+engine to `omarchy-speak-ctl` explicitly for a one-off.
+
 Keys were checked against `omarchy menu keybindings --print` before choosing;
 `SUPER+SHIFT+S` and the `SUPER+CTRL+R` family are Omarchy defaults, so the
 speaking lives on `R` with modifiers and the queue on the bracket pair next to
 it (`SUPER+ALT+[`/`]` belong to the webcam overlay, hence the `SHIFT` for
 queueing).
+
+## The voice picker
+
+    omarchy-speak-ui          # or SUPER+SHIFT+R
+
+```
+ omarchy-speak                          default af_sarah @ 1.00
+ all  American  British  Spanish  French  Hindi  Italian  Japanese
+ af_alloy          af_sarah
+ af_aoede          American female
+ af_bella
+ af_heart          speed  1.00   - / +
+ ...               chunk   350   [ / ]
+*af_sarah          first sound  560 ms
+ am_adam
+ level ──────────────────────────────────────────
+ enter/l audition   [ ] chunk   w save   r reset   q quit
+```
+
+| | |
+|---|---|
+| `↑` `↓` `j` `k` `PgUp` `PgDn` · wheel · click | move |
+| `←` `→` `Tab` | filter by language |
+| `Enter` / `Space` | audition a sentence |
+| `l` | audition a long passage — the only way to hear chunk size |
+| `+` `-` | speed |
+| `[` `]` | chunk size |
+| `w` | save voice, speed and chunk as the default |
+| `r` | reset (see below) |
+| `R` | reload the voice list |
+
+There are no written voice descriptions. Kokoro ships none, so they would be 54
+strings to write and maintain, and a sentence about a voice is worse than the
+button that plays it. What is shown is what the name already encodes: first
+letter language, second gender.
+
+**The level meter reads the output sink**, not the synthesiser. A meter fed from
+the engine bounces happily while a Bluetooth speaker that is connected but
+asleep swallows every sample. Fed from the sink, a flat bar during playback
+means no sound is reaching the world — which is worth knowing, and is also why
+`first sound` is measured from the meter rather than from the engine's pipe.
+
+**Saving restarts the daemon**, which reads its config once at startup, so a
+write alone would change nothing anyone could hear.
+
+## Reading a document
+
+    omarchy-speak-ctl read [file] [engine]
+
+No path opens a file chooser. `.txt` and `.md` only — PDF needs a dependency and
+extraction quality varies wildly, and "it read my paper wrong" is worse than
+"not supported yet".
+
+Markdown is stripped rather than spoken: raw `.md` reads as *"hash hash
+Introduction, star star important star star"*, and code fences are worse.
+Headings, emphasis, bullets, blockquotes, rules, tables, images and comments go;
+link text stays and the URL goes.
+
+The file is queued **by section**, not spoken as one clip. A single utterance is
+truncated at `max_chars`, so a long document would silently lose its tail;
+queueing also means playback starts on section one while the rest is still being
+posted, and `SUPER+[` / `SUPER+]` become document navigation.
+
+## When something is wrong
+
+    omarchy-speak-ctl reset
+
+Writes a diagnostic report to `$XDG_STATE_HOME/omarchy-speak/last-reset.md`
+**before** restarting the engine and daemon. A reset that only restarts destroys
+the evidence for the bug it just papered over, and the failures worth reporting
+here look identical from outside: a wedged engine, a sink that accepts audio
+without playing it, a daemon that believes it is speaking.
+
+The report holds `/status` and `/config`, a **timed liveness probe per engine**
+(the most diagnostic line in the file — a wedged kokoro worker blocks at ~0% CPU
+and is otherwise indistinguishable from a slow one), the default sink and
+connected Bluetooth devices, 40 journal lines, and unit states with restart
+counts.
+
+It deliberately does not diagnose the cause or touch the audio sink. It reports
+facts and lets a human read them.
+
+## A voice per source
+
+Utterances can name a voice, or a profile the machine maps to one:
+
+```json
+"voices": {
+  "system": "af_sarah",
+  "claude": "am_michael",
+  "codex":  "am_fenrir",
+  "herdr":  "af_heart"
+}
+```
+
+The queue holds whatever mix you give it, so a conversation is just a sequence
+of clips with different voices. `tools/render-conversation` renders one to a
+single wav, with per-turn speed and gap:
+
+```bash
+tools/render-conversation script.json out.wav
+```
+
+Per-turn speed and gap are the only delivery controls that exist — kokoro has no
+prosody, emphasis or laughter — so they carry more weight than they look like
+they should. Two speakers at an identical pace read as one person doing both
+parts.
+
+## Omarchy bar module
+
+A status-bar readout of the configured voice, or whoever is currently talking.
+See [`omarchy/README.md`](omarchy/README.md). `install.sh` puts the script in
+place when `~/.config/omarchy` exists; it does nothing until an entry is added
+to `shell.json`.
 
 ## The queue
 
@@ -434,8 +561,27 @@ back to the clipboard when nothing is selected — see
 
 `startup_grace` sits inside an **engine** block and is how long that engine may
 take to produce its first sample before playback is presumed stuck. Default 30
-seconds; kokoro ships with 120 because it loads a model. See
+seconds; neither shipped engine overrides it. See
 [When nothing plays](#when-nothing-plays).
+
+`chunk_chars` also sits inside an engine block and is the single biggest lever
+on how long you wait before the first word of a long passage — the first chunk
+*is* that wait. Measured on a CPU-only i7-8550U with 2584 characters:
+
+| chunk | first audio |
+|---|---|
+| 80 | 2158 ms |
+| 150 | 4167 ms |
+| 250 | 7822 ms |
+| 350 | 8307 ms |
+
+The same sweep on a CUDA machine lands between 454 and 596 ms at *every* size —
+noise. So a fast machine should leave it at 350 and take the fewer seams, and a
+slow one should drop it. The picker's `[` and `]` adjust it, and `l` plays a long
+passage so you can hear the difference rather than guess at it.
+
+`voices` is a top-level map of profile to voice; see
+[A voice per source](#a-voice-per-source).
 
 ## HTTP API
 
@@ -447,10 +593,10 @@ just `curl` in a trenchcoat.
 | `GET` | `/status` | | Is it speaking, paused, and where in the queue |
 | `GET` | `/engines` | | Configured engines |
 | `GET` | `/queue` | | The queue, and which clip is current |
-| `POST` | `/speak` | `{"text":…, "engine":…}` | Speak literal text, replacing the queue |
+| `POST` | `/speak` | `{"text":…, "engine":…, "voice":…, "profile":…, "speed":…}` | Speak literal text, replacing the queue |
 | `POST` | `/speak/selection` | `{"engine":…}` | Speak the primary selection, or the clipboard if there is none |
 | `POST` | `/speak/clipboard` | `{"engine":…}` | Speak the clipboard |
-| `POST` | `/queue` | `{"text":…, "engine":…}` | Append text to the queue |
+| `POST` | `/queue` | `{"text":…, "engine":…, "voice":…, "profile":…, "speed":…}` | Append text to the queue |
 | `POST` | `/queue/selection` | `{"engine":…}` | Append the primary selection, or the clipboard if there is none |
 | `POST` | `/queue/clipboard` | `{"engine":…}` | Append the clipboard |
 | `POST` | `/queue/clear` | | Drop everything except what is playing |
@@ -468,6 +614,25 @@ curl -X POST -H 'Content-Type: application/json' \
   -d '{"text":"the daemon is listening"}' \
   http://127.0.0.1:8765/speak
 ```
+
+**`voice`, `profile` and `speed` apply to that utterance only**, so a queue can
+hold a conversation:
+
+```bash
+curl -sX POST -d '{"text":"First speaker.","voice":"af_bella"}'   .../speak
+curl -sX POST -d '{"text":"And a second.","voice":"am_michael"}'  .../queue
+```
+
+Prefer `profile` to `voice` wherever the caller is a program. A caller naming a
+voice has to know which voices exist on this machine, so it breaks anywhere
+that one is missing or unwanted; a caller naming a profile says what it *is*
+and lets the machine decide how that sounds. Unknown profiles fall back to the
+configured voice rather than failing — an agent nobody has set up should still
+be heard, just not distinctly.
+
+`source` accepts `primary` or `clipboard`. Anything else is an error: it used
+to fall through to the clipboard, so a request naming a source that does not
+exist quietly spoke whatever happened to be copied.
 
 Because it's plain HTTP, a status-bar widget or a browser extension can be added later
 without touching the daemon.
