@@ -74,8 +74,19 @@ DEFAULT_CONFIG = {
             # already wedged. They would have hidden a hung engine for a full
             # minute on every request -- the precise failure this watchdog
             # exists to catch.
-            "speak": ["omarchy-speak-kokoro", "--voice", "{voice}", "--output-raw"],
-            "save": ["omarchy-speak-kokoro", "--voice", "{voice}", "--output-file", "{out}"],
+            "speed": 1.0,
+            "chunk_chars": 350,
+            # Every tunable appears in the template, because render() substitutes
+            # from this block and a setting the template does not mention is a
+            # setting the daemon silently ignores. The UI writes speed and
+            # chunk_chars here; without the flags below they would be saved,
+            # reported as saved, and have no effect on anything the daemon says.
+            "speak": ["omarchy-speak-kokoro", "--voice", "{voice}",
+                      "--speed", "{speed}", "--chunk-chars", "{chunk_chars}",
+                      "--output-raw"],
+            "save": ["omarchy-speak-kokoro", "--voice", "{voice}",
+                     "--speed", "{speed}", "--chunk-chars", "{chunk_chars}",
+                     "--output-file", "{out}"],
             "play": ["aplay", "-q", "-r", "24000", "-f", "S16_LE", "-t", "raw", "-"],
         },
     },

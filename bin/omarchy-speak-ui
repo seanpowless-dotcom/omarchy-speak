@@ -143,12 +143,55 @@ def read_config() -> dict:
         return {}
 
 
-def write_engine_setting(key: str, value) -> None:
-    """Persist one kokoro setting, leaving the rest of the file alone."""
+# A setting only reaches the engine if the command template mentions it:
+# render() substitutes {placeholders} from the engine block, so a key the
+# template never names is written, reported as saved, and silently ignored.
+# Configs written before these flags existed are exactly in that state.
+TEMPLATE_FLAGS = {"speed": "--speed", "chunk_chars": "--chunk-chars"}
+
+
+def ensure_template_uses(engine: dict, key: str) -> bool:
+    """Add the flag for `key` to this engine's commands if it is missing.
+
+    Returns whether anything changed. Only touches commands that already
+    invoke omarchy-speak-kokoro, so a hand-written template for some other
+    binary is left alone.
+    """
+    flag = TEMPLATE_FLAGS.get(key)
+    if not flag:
+        return False
+    changed = False
+    for name in ("speak", "save"):
+        cmd = engine.get(name)
+        if not isinstance(cmd, list) or not cmd:
+            continue
+        if "omarchy-speak-kokoro" not in cmd[0]:
+            continue
+        if any(flag == arg for arg in cmd):
+            continue
+        # Before the trailing output flag, so the command reads naturally.
+        insert = len(cmd)
+        for i, arg in enumerate(cmd):
+            if arg.startswith("--output"):
+                insert = i
+                break
+        cmd[insert:insert] = [flag, "{" + key + "}"]
+        changed = True
+    return changed
+
+
+def write_engine_setting(key: str, value) -> tuple[bool, bool]:
+    """Persist one kokoro setting, leaving the rest of the file alone.
+
+    Returns (written, template_repaired).
+    """
     cfg = read_config()
-    cfg.setdefault("engines", {}).setdefault("kokoro", {})[key] = value
+    engine = cfg.setdefault("engines", {}).setdefault("kokoro", {})
+    engine[key] = value
+    repaired = ensure_template_uses(engine, key)
     CONFIG.parent.mkdir(parents=True, exist_ok=True)
     CONFIG.write_text(json.dumps(cfg, indent=2) + "\n")
+    return True, repaired
 
 
 # ── level meter ─────────────────────────────────────────────────────────────
@@ -510,16 +553,20 @@ class App:
         voice = self.selected()
         if not voice:
             return
-        write_engine_setting("voice", voice)
-        write_engine_setting("speed", self.speed)
-        write_engine_setting("chunk_chars", self.chunk)
+        repaired = False
+        for key, value in (("voice", voice), ("speed", self.speed),
+                           ("chunk_chars", self.chunk)):
+            _, fixed = write_engine_setting(key, value)
+            repaired = repaired or fixed
         self.current = voice
         self.saved = f"{voice} @ {self.speed:.2f}"
         self.status = "saved; restarting daemon..."
         self.draw()
         subprocess.run(["systemctl", "--user", "restart", "omarchy-speak"],
                        capture_output=True)
-        self.status = f"saved {voice} @ {self.speed:.2f}"
+        self.status = (f"saved {voice} @ {self.speed:.2f}, chunk {self.chunk}"
+                       + ("  (added missing flags to your speak template)"
+                          if repaired else ""))
 
     def reset(self) -> None:
         """Hand off to `omarchy-speak-ctl reset`, if this ctl has it.
