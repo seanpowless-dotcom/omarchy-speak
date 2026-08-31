@@ -17,17 +17,21 @@ on save:
 
 ## What it shows
 
-    󰖀 af_sarah          idle
-    󰖀 af_sarah ▁        queued behind something
-    󰖀 af_sarah █▆       speaking, audio reaching the sink
-    󰖀 af_sarah          speaking, and NOTHING reaching the sink
+    󰖀 af_sarah      idle — the configured voice
+    󰖀 af_sarah 3    idle, three clips queued
+    󰖀 am_michael    speaking — whoever is actually talking
 
-That last one is the reason the level is read from the **output sink** rather
-than from the daemon. "The daemon believes it is speaking" and "sound is coming
-out" are different claims, and the gap between them is a real failure: a
-Bluetooth speaker that is connected but asleep swallows audio silently, so the
-daemon reports playback while the room stays quiet. A flat bar against a
-`speaking` state is the interesting reading, and the tooltip says so outright.
+Idle it shows the configured voice; while speaking it shows the voice actually
+sounding. Those are the same today, and routinely different once utterances can
+choose a voice per source.
+
+The **output sink is still checked**, but no longer drawn. "The daemon believes
+it is speaking" and "sound is coming out" are different claims, and the gap
+between them is a real failure: a Bluetooth speaker that is connected but asleep
+swallows audio silently while the daemon reports playback. That state sets
+`class` to `silent` rather than `speaking`, and the tooltip says outright:
+
+    no audio at the sink — is the output device awake?
 
 ## Cost
 
@@ -37,6 +41,6 @@ config read and one loopback request — about 50ms.
 
 ## Limitation
 
-The bar runs this on an interval, so at one second it is a coarse activity
-readout rather than a smooth meter. A true meter would need a streaming QML
-plugin rather than a command module.
+The bar runs this on an interval, so state changes land within a second rather
+than instantly. That is fine for a name; it is why the level bar this replaced
+was not worth keeping, since four cells sampled once a second is not a meter.

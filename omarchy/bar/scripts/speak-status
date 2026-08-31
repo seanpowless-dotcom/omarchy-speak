@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
-"""Bar module for omarchy-speak: the configured voice, and a level bar.
+"""Bar module for omarchy-speak: which voice is configured, or currently talking.
 
 Prints one Waybar-style JSON object and exits; the bar runs it on an interval.
 
-The level is read from the OUTPUT SINK rather than from the daemon, because
-"the daemon believes it is speaking" and "sound is coming out" are different
-claims, and the gap between them is a real failure mode -- a Bluetooth speaker
-that is connected but asleep swallows audio silently. A flat bar while the
-daemon says it is speaking is therefore the interesting reading, not a glitch.
+Idle it shows the configured voice; while speaking it shows the voice actually
+sounding, which is not necessarily the same one and will differ routinely once
+utterances can pick a voice per source.
 
-Sampling the sink costs ~150ms, which is far too much to spend every interval
-forever, so it is only paid when the daemon says something is playing. Idle
-ticks are a config read and a loopback request.
+The sink is still checked, but no longer drawn. "The daemon believes it is
+speaking" and "sound is coming out" are different claims, and the gap between
+them is a real failure -- a Bluetooth speaker that is connected but asleep
+swallows audio silently while the daemon reports playback. That reading is
+worth keeping; a four-cell level bar sampled once a second was not.
+
+Checking the sink costs ~150ms, far too much to spend every interval forever,
+so it is only paid while something is playing. Idle ticks are a config read
+and a loopback request.
 """
 
 import json
@@ -26,7 +30,6 @@ BASE = "http://%s:%s" % (os.environ.get("OMARCHY_SPEAK_HOST", "127.0.0.1"),
 CONFIG = Path(os.environ.get("OMARCHY_SPEAK_CONFIG",
                              "~/.config/omarchy-speak/config.json")).expanduser()
 ICON = "\U000f0580"          # nf-md-account_voice
-BLOCKS = " ▁▂▃▄▅▆▇█"
 
 
 def out(text, tooltip, cls):
@@ -81,14 +84,6 @@ def level():
     return min(1.0, (max(abs(v) for v in vals) / 32768.0) * 2.0)
 
 
-def bar(value, width=4):
-    filled = value * width
-    cells = []
-    for i in range(width):
-        share = max(0.0, min(1.0, filled - i))
-        cells.append(BLOCKS[int(share * (len(BLOCKS) - 1))])
-    return "".join(cells)
-
 
 def main():
     voice, engine = voice_and_engine()
@@ -105,15 +100,17 @@ def main():
         out(text, "omarchy-speak %s\nvoice %s (%s)" % (state, voice, engine), state)
         return
 
-    lvl = level()
+    # Whoever is actually talking, falling back to the configured voice for a
+    # daemon too old to report it.
+    speaking_voice = st.get("voice") or voice
+    audible = level() >= 0.01
     tip = "omarchy-speak speaking\nvoice %s (%s)\n%s" % (
-        voice, engine,
-        st.get("current") or "")
-    if lvl < 0.01:
-        # Playing, but nothing is reaching the sink. Worth saying out loud.
+        speaking_voice, engine, st.get("current") or "")
+    if not audible:
+        # Playing, but nothing is reaching the sink. Not drawn, but said.
         tip += "\n\nno audio at the sink — is the output device awake?"
-    out("%s %s %s" % (ICON, voice, bar(lvl)), tip.strip(),
-        "speaking" if lvl >= 0.01 else "silent")
+    out("%s %s" % (ICON, speaking_voice), tip.strip(),
+        "speaking" if audible else "silent")
 
 
 if __name__ == "__main__":

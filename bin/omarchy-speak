@@ -389,6 +389,10 @@ class Player:
                 "speaking": live and not self._paused,
                 "paused": live and self._paused,
                 "engine": clip.engine if clip else None,
+                # Which voice is actually sounding, which is not necessarily the
+                # configured default -- and once utterances can name a voice, is
+                # the only way to know who is talking.
+                "voice": (clip.spec.get("voice") if clip else None),
                 "elapsed": round(self._elapsed(), 2) if live else 0,
                 "index": self._index if live else -1,
                 "queued": len(self._queue),
