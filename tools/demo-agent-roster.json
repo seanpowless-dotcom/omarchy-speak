@@ -1,0 +1,9 @@
+[
+  {"voice": "am_michael", "text": "Voice check. Each agent, one line. If two of us sound alike, swap one.", "gap": 0.6},
+  {"voice": "af_heart",   "text": "herdr here. Your workspace, your panes, your sessions.", "speed": 1.05},
+  {"voice": "am_michael", "text": "Claude. I read the code, I make the change, I tell you what I actually verified."},
+  {"voice": "am_fenrir",  "text": "Codex. Same job, different opinions about it.", "speed": 1.08, "gap": 0.2},
+  {"voice": "af_nova",    "text": "Qwen Code, reporting. I will take the long context, thank you.", "speed": 1.05},
+  {"voice": "bm_george",  "text": "Hermes. I carry the message, I do not write it.", "speed": 0.95, "gap": 0.6},
+  {"voice": "am_michael", "text": "That is the roster. Reassign anyone who blurs into the others."}
+]

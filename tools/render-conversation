@@ -1,0 +1,81 @@
+#!/usr/bin/env python3
+"""Render a multi-voice conversation to a single wav.
+
+    render-conversation script.json out.wav
+
+The script is a list of turns, each a voice and a line, optionally with a speed
+and the silence that follows it:
+
+    [
+      {"voice": "af_bella",   "text": "Did you hear about the build?"},
+      {"voice": "am_michael", "text": "Go on.", "speed": 1.1, "gap": 0.15},
+      {"voice": "af_river",   "text": "It said it was speaking.", "gap": 0.6}
+    ]
+
+Each line is synthesised by its own voice and the raw PCM is concatenated, so
+no mixing tools are needed: kokoro emits 24kHz mono s16, which is already the
+wav payload format.
+
+Two things make this sound like a conversation rather than a list. Speed varies
+per speaker, because two people at an identical pace read as one person doing
+both parts. And the gap after a turn varies -- a quick reaction follows close
+behind, a line that lands a point is given room. Neither is expressive control,
+which kokoro does not have; they are the parts of delivery that can be faked
+from outside the model.
+"""
+
+import json
+import subprocess
+import sys
+import wave
+from pathlib import Path
+
+RATE = 24000
+DEFAULT_GAP = 0.35
+
+
+def say(voice: str, text: str, speed: float) -> bytes:
+    proc = subprocess.run(
+        ["omarchy-speak-kokoro", "--voice", voice, "--speed", f"{speed:.2f}",
+         "--output-raw"],
+        input=text.encode(), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        timeout=600)
+    if not proc.stdout:
+        err = proc.stderr.decode("utf-8", "replace").strip()[:200]
+        raise RuntimeError(f"{voice}: produced no audio. {err}")
+    return proc.stdout
+
+
+def render(turns: list[dict], out_path: Path, quiet: bool = False) -> float:
+    pcm = bytearray()
+    for i, turn in enumerate(turns, 1):
+        voice = turn["voice"]
+        audio = say(voice, turn["text"], float(turn.get("speed", 1.0)))
+        seconds = len(audio) / 2 / RATE
+        if not quiet:
+            print(f"  {i:3d}. {voice:<12} {seconds:5.1f}s  {turn['text'][:52]}")
+        pcm += audio
+        pcm += b"\x00\x00" * int(RATE * float(turn.get("gap", DEFAULT_GAP)))
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(out_path), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(RATE)
+        w.writeframes(bytes(pcm))
+    return len(pcm) / 2 / RATE
+
+
+def main() -> int:
+    if len(sys.argv) != 3:
+        print(__doc__.strip().splitlines()[2].strip())
+        return 2
+    script = json.loads(Path(sys.argv[1]).read_text())
+    out = Path(sys.argv[2]).expanduser()
+    total = render(script, out)
+    print(f"  -> {out}  ({out.stat().st_size / 1024:.0f} KB, {total:.1f}s)")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
