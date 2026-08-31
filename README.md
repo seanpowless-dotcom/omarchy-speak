@@ -363,16 +363,23 @@ killed and the reason goes to the journal. Paused clips are exempt: pausing one
 over lunch is not a stall.
 
 `startup_grace` is **per engine** (default 30s), because it covers everything
-before the first sample — process spawn, model load, warm-up — and a
-model-loading engine on a slow machine is not stuck merely for being slow to
-start. Kokoro ships declaring `"startup_grace": 60` as headroom for a CPU-only
-machine; on CUDA it starts a 43-character clip in **0.56 seconds**.
+before the first sample — process spawn, model load, warm-up. Neither shipped
+engine overrides it, because measurement says neither needs to:
+
+| | first sample |
+|---|---|
+| kokoro, CUDA | 0.56 s |
+| kokoro, warm, i7-8550U no CUDA | 1.3 s |
+| kokoro, **worker stopped**, same machine | 2.2 s |
+| piper, same machine | 1.4–1.6 s |
+
+The 30-second default covers the worst of those more than ten times over.
 
 Resist making it large. A long grace protects nothing — it only delays
-noticing a broken engine. **A kokoro request that blocks for minutes at
-near-zero CPU has not gone slow, it has wedged**: the warm worker does this
-after long uptimes, and `systemctl --user restart omarchy-speak-kokoro` fixes
-it in one command. Check CPU usage before reaching for a bigger number.
+noticing a broken engine. **A request that blocks for minutes at near-zero CPU
+has not gone slow, it has wedged**: kokoro's warm worker does this after long
+uptimes, and `systemctl --user restart omarchy-speak-kokoro` fixes it in one
+command. Check CPU usage before reaching for a bigger number.
 
 The same budget bounds `/save` and file-mode synthesis, which the watchdog
 cannot reach — they run synchronously, so a wedged engine there would hold the

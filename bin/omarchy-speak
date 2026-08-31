@@ -63,12 +63,17 @@ DEFAULT_CONFIG = {
         "kokoro": {
             "mode": "stream",
             "voice": "af_sarah",
-            # Loads a model before the first sample, so it needs more headroom
-            # than piper's default. This is headroom for a CPU-only machine, not
-            # a measurement: on CUDA the same clip starts in 0.56s. If kokoro
-            # blocks for longer than this at near-zero CPU, the warm worker has
-            # wedged rather than gone slow -- restart omarchy-speak-kokoro.
-            "startup_grace": 60,
+            # No startup_grace override, because measurement says it needs none.
+            # On the slowest machine here -- an i7-8550U with no CUDA -- kokoro
+            # reaches first sample in 1.3s warm and 2.2s with its worker stopped
+            # entirely, against piper's 1.4-1.6s. The 30s default covers that
+            # more than ten times over.
+            #
+            # Two earlier values, 120 and then 60, were invented rather than
+            # measured, from a 30s reading that turned out to be a warm worker
+            # already wedged. They would have hidden a hung engine for a full
+            # minute on every request -- the precise failure this watchdog
+            # exists to catch.
             "speak": ["omarchy-speak-kokoro", "--voice", "{voice}", "--output-raw"],
             "save": ["omarchy-speak-kokoro", "--voice", "{voice}", "--output-file", "{out}"],
             "play": ["aplay", "-q", "-r", "24000", "-f", "S16_LE", "-t", "raw", "-"],
@@ -105,11 +110,13 @@ STALL_CHARS_PER_SECOND = 4.0
 # one, and that says nothing about whether it is stuck.
 #
 # Resist the temptation to make it large. A long grace does not protect healthy
-# playback -- it only delays noticing a broken engine. Measured on a machine
-# with CUDA, kokoro produces a 43-character clip in 0.56s; the same request
-# against a warm worker that had wedged blocked for over 180s at ~0% CPU. No
-# grace distinguishes those two, so the grace should be sized for a slow
-# machine's model load and nothing more.
+# playback -- it only delays noticing a broken engine.
+#
+# Measured, first sample arrives in 0.56s (kokoro on CUDA), 1.3s (kokoro warm,
+# i7-8550U, no CUDA), 2.2s (same, worker stopped) and 1.4-1.6s (piper, same
+# machine). A wedged worker, by contrast, blocked for over 180s at ~0% CPU. No
+# grace tells those apart, so size it for a slow machine's model load and stop:
+# every second beyond that is a second of a hung engine looking healthy.
 DEFAULT_STARTUP_GRACE = 30.0
 
 
