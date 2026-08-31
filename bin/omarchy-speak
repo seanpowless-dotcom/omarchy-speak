@@ -40,6 +40,10 @@ DEFAULT_CONFIG = {
     "port": 8765,
     "default_engine": "piper",
     "save_dir": "~/Audio/speak",
+    # Profile -> voice. A caller sends {"profile": "claude"} and this decides
+    # what that sounds like on this machine. Unlisted profiles use the engine's
+    # configured voice.
+    "voices": {},
     # True: ask where to save. False: write straight to save_dir.
     "save_prompt": True,
     # Speaking the selection falls back to the clipboard when no selection
@@ -289,8 +293,16 @@ class SelectionFallback:
         The second value differs from `source` exactly when the fallback
         fired, which is the only way a caller can tell that it did.
         """
-        if source != "primary":
+        if source == "clipboard":
             return read_selection(primary=False), source
+        if source != "primary":
+            # Anything else is a caller mistake. This used to fall through to
+            # the clipboard, so a request naming a source that does not exist
+            # quietly spoke whatever happened to be copied -- which reads as
+            # the daemon ignoring the text it was given.
+            raise RuntimeError(
+                f"unknown source {source!r}; use 'primary', 'clipboard', "
+                f"or omit it and pass 'text'")
 
         text = read_selection(primary=True)
         if text:
@@ -774,7 +786,54 @@ class Handler(BaseHTTPRequestHandler):
         missing = self._missing_binaries(spec)
         if missing:
             raise RuntimeError(f"{engine}: missing binaries: {', '.join(missing)}")
+
+        spec = self._with_overrides(cfg, spec, body)
         return text, engine, spec, used
+
+    @staticmethod
+    def _with_overrides(cfg: dict, spec: dict, body: dict) -> dict:
+        """Apply per-utterance voice and speed.
+
+        Two forms, and the second is the one to prefer:
+
+            {"voice": "am_michael"}   this exact voice
+            {"profile": "claude"}     whatever this machine calls that
+
+        A caller that names a voice has to know which voices exist here, so it
+        breaks on any machine where that one is missing or unwanted. A caller
+        that names a profile says what it *is* and lets the machine decide how
+        that sounds, which is the same trade the chord bindings and engine
+        choice already make. Profiles live under a top-level "voices" map.
+
+        An unknown profile falls back to the configured voice rather than
+        failing: an agent whose profile nobody has set up should still be
+        heard, just not distinctly.
+
+        The spec is COPIED. Mutating it would rewrite the engine block that
+        every later utterance reads, so one request naming a voice would
+        silently repoint the default.
+        """
+        overrides = {}
+
+        voice = body.get("voice")
+        if not voice and body.get("profile"):
+            voice = cfg.get("voices", {}).get(body["profile"])
+        if voice:
+            overrides["voice"] = voice
+
+        # Speed varies per line for the same reason voice does. Two speakers at
+        # an identical pace read as one person doing both parts, and a line
+        # that lands a point wants slowing down. Clamped because the engine
+        # accepts anything and a stray zero would hang synthesis.
+        if body.get("speed") is not None:
+            try:
+                overrides["speed"] = max(0.5, min(2.0, float(body["speed"])))
+            except (TypeError, ValueError):
+                pass
+
+        if not overrides:
+            return spec
+        return {**spec, **overrides}
 
     def _nothing_to_speak(self, source: str | None) -> str:
         """Says what to do about it, not just that it happened.
