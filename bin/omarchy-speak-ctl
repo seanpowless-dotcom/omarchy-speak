@@ -60,6 +60,7 @@ omarchy-speak-ctl <command> [engine] [path]
   clear                  drop everything except what is playing
   save [engine] [path]   render the selection to a file
   status                 report daemon state
+  reset                  snapshot diagnostics, then restart the engine and daemon
 
 Engines come from the daemon config; omit to use the default.
 USAGE
@@ -164,6 +165,86 @@ print(json.dumps(body))
   status)
     curl -sS -m 5 "$BASE/status" | python3 -m json.tool 2>/dev/null \
       || { notify "Speak: daemon not running"; exit 1; }
+    ;;
+  reset)
+    # Snapshot BEFORE restarting. A reset that fixes the problem and destroys
+    # the evidence leaves nothing to report, and the failures worth reporting
+    # here are the ones that look identical from outside: a wedged engine, an
+    # audio sink that accepts audio without playing it, and a daemon that
+    # believes it is still speaking. Each of those is one line below.
+    state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-speak"
+    mkdir -p "$state_dir"
+    report="$state_dir/last-reset.md"
+
+    {
+      echo "# omarchy-speak reset — $(date -Is)"
+      echo
+      echo '## Daemon'
+      echo '```'
+      curl -sS -m 5 "$BASE/status" 2>&1 | python3 -m json.tool 2>/dev/null || echo "not reachable"
+      curl -sS -m 5 "$BASE/config" 2>&1 | python3 -m json.tool 2>/dev/null
+      echo '```'
+
+      echo
+      echo '## Engine liveness'
+      echo '```'
+      # The single most diagnostic line here. A wedged kokoro worker blocks at
+      # ~0% CPU and is otherwise indistinguishable from one that is merely slow;
+      # a short timeout tells them apart in one number.
+      for eng in $(curl -sS -m 5 "$BASE/engines" 2>/dev/null \
+                   | python3 -c 'import json,sys;print(" ".join(json.load(sys.stdin)["engines"]))' 2>/dev/null); do
+        start=$(date +%s%N)
+        if curl -sS -m 12 -H 'Content-Type: application/json' \
+             -d "{\"engine\":\"$eng\",\"source\":\"text\",\"text\":\"test\",\"path\":\"$state_dir/probe.wav\"}" \
+             "$BASE/save" >/dev/null 2>&1; then
+          echo "$eng: OK ($(( ($(date +%s%N) - start) / 1000000 )) ms)"
+        else
+          echo "$eng: FAILED or timed out after $(( ($(date +%s%N) - start) / 1000000 )) ms"
+        fi
+        rm -f "$state_dir/probe.wav"
+      done
+      echo '```'
+
+      echo
+      echo '## Audio sink'
+      echo '```'
+      # A Bluetooth speaker that is connected but asleep accepts audio and never
+      # plays it, which reads exactly like a broken daemon. Report the sink;
+      # do not try to guess whether it is at fault.
+      command -v wpctl >/dev/null && wpctl status 2>/dev/null | sed -n '/Sinks:/,/Sources:/p' || echo "wpctl unavailable"
+      command -v bluetoothctl >/dev/null && bluetoothctl devices Connected 2>/dev/null
+      echo '```'
+
+      echo
+      echo '## Journal'
+      echo '```'
+      journalctl --user -u omarchy-speak -u omarchy-speak-kokoro -n 40 --no-pager 2>&1 | tail -40
+      echo '```'
+
+      echo
+      echo '## Versions'
+      echo '```'
+      echo "omarchy-speak: $(command -v omarchy-speak)"
+      for u in omarchy-speak omarchy-speak-kokoro; do
+        echo "$u: $(systemctl --user is-active $u 2>&1), restarts=$(systemctl --user show $u -p NRestarts --value 2>/dev/null)"
+      done
+      uname -sr; . /etc/os-release 2>/dev/null && echo "$PRETTY_NAME"
+      echo '```'
+    } >"$report" 2>&1
+
+    echo "Wrote $report"
+    echo "Restarting..."
+    systemctl --user restart omarchy-speak-kokoro 2>/dev/null
+    systemctl --user restart omarchy-speak 2>/dev/null
+    sleep 2
+    if curl -sS -m 5 "$BASE/status" >/dev/null 2>&1; then
+      notify "Speak: reset" "Daemon back up. Report: $report"
+      echo "Daemon is answering again."
+    else
+      notify "Speak: reset" "Daemon did NOT come back — see $report"
+      echo "Daemon is NOT answering. See $report" >&2
+      exit 1
+    fi
     ;;
   ""|-h|--help) usage ;;
   *) usage; exit 1 ;;
