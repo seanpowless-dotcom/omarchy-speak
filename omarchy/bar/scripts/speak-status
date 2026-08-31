@@ -1,0 +1,117 @@
+#!/usr/bin/env python3
+"""Bar module for omarchy-speak: which voice is configured, or currently talking.
+
+Prints one Waybar-style JSON object and exits; the bar runs it on an interval.
+
+Idle it shows the configured voice; while speaking it shows the voice actually
+sounding, which is not necessarily the same one and will differ routinely once
+utterances can pick a voice per source.
+
+The sink is still checked, but no longer drawn. "The daemon believes it is
+speaking" and "sound is coming out" are different claims, and the gap between
+them is a real failure -- a Bluetooth speaker that is connected but asleep
+swallows audio silently while the daemon reports playback. That reading is
+worth keeping; a four-cell level bar sampled once a second was not.
+
+Checking the sink costs ~150ms, far too much to spend every interval forever,
+so it is only paid while something is playing. Idle ticks are a config read
+and a loopback request.
+"""
+
+import json
+import os
+import struct
+import subprocess
+import urllib.request
+from pathlib import Path
+
+BASE = "http://%s:%s" % (os.environ.get("OMARCHY_SPEAK_HOST", "127.0.0.1"),
+                         os.environ.get("OMARCHY_SPEAK_PORT", "8765"))
+CONFIG = Path(os.environ.get("OMARCHY_SPEAK_CONFIG",
+                             "~/.config/omarchy-speak/config.json")).expanduser()
+ICON = "\U000f0580"          # nf-md-account_voice
+
+
+def out(text, tooltip, cls):
+    # ensure_ascii=False: the icon is outside the BMP, and escaping it produces a
+    # surrogate pair that not every JSON reader handles.
+    print(json.dumps({"text": text, "tooltip": tooltip, "class": cls},
+                     ensure_ascii=False))
+
+
+def status():
+    try:
+        with urllib.request.urlopen(BASE + "/status", timeout=1.5) as r:
+            return json.load(r)
+    except Exception:
+        return None
+
+
+def voice_and_engine():
+    try:
+        cfg = json.loads(CONFIG.read_text())
+    except (OSError, ValueError):
+        return "?", "?"
+    engine = cfg.get("default_engine", "?")
+    return cfg.get("engines", {}).get(engine, {}).get("voice", engine), engine
+
+
+def level():
+    """Peak level of the default sink over ~100ms, as 0.0-1.0."""
+    try:
+        sink = subprocess.run(["pactl", "get-default-sink"], capture_output=True,
+                              text=True, timeout=2).stdout.strip()
+        if not sink:
+            return 0.0
+        # parec never exits on its own, so it must be read for a fixed amount
+        # and then killed. Running it to completion under a timeout always
+        # raises, which silently reported every sample as silence.
+        proc = subprocess.Popen(
+            ["parec", "--device=%s.monitor" % sink, "--format=s16le",
+             "--rate=8000", "--channels=1", "--latency-msec=20"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        try:
+            raw = proc.stdout.read(1600)          # ~100ms at 8kHz mono s16
+        finally:
+            proc.kill()
+            proc.wait(timeout=1)
+    except (OSError, subprocess.SubprocessError):
+        return 0.0
+    n = len(raw) // 2
+    if not n:
+        return 0.0
+    vals = struct.unpack("<%dh" % n, raw[: n * 2])
+    return min(1.0, (max(abs(v) for v in vals) / 32768.0) * 2.0)
+
+
+
+def main():
+    voice, engine = voice_and_engine()
+    st = status()
+    if st is None:
+        out("%s %s" % (ICON, voice), "omarchy-speak: daemon not running", "off")
+        return
+    if not st.get("speaking"):
+        state = "paused" if st.get("paused") else "idle"
+        queued = st.get("queued") or 0
+        text = "%s %s" % (ICON, voice)
+        if queued:
+            text += " %d" % queued
+        out(text, "omarchy-speak %s\nvoice %s (%s)" % (state, voice, engine), state)
+        return
+
+    # Whoever is actually talking, falling back to the configured voice for a
+    # daemon too old to report it.
+    speaking_voice = st.get("voice") or voice
+    audible = level() >= 0.01
+    tip = "omarchy-speak speaking\nvoice %s (%s)\n%s" % (
+        speaking_voice, engine, st.get("current") or "")
+    if not audible:
+        # Playing, but nothing is reaching the sink. Not drawn, but said.
+        tip += "\n\nno audio at the sink — is the output device awake?"
+    out("%s %s" % (ICON, speaking_voice), tip.strip(),
+        "speaking" if audible else "silent")
+
+
+if __name__ == "__main__":
+    main()

@@ -9,8 +9,12 @@
 -- again to pick up where it left off.
 o.bind("SUPER + R", "Speak selection (play/pause)", "omarchy-speak-ctl playpause")
 
--- Same text, better voice, slower to start.
-o.bind("SUPER + SHIFT + R", "Speak selection (kokoro)", "omarchy-speak-ctl selection kokoro")
+-- The voice picker: voices, speed, chunk size, and a level meter that reads the
+-- output sink. This key used to force the kokoro engine, which is a no-op on any
+-- machine where kokoro is already the default -- same engine, same result as
+-- SUPER+R. Pass an engine to omarchy-speak-ctl explicitly if you want the other
+-- one for a single utterance; a keybind is the wrong place to spend on it.
+o.bind("SUPER + SHIFT + R", "Speak: voice picker", "omarchy-launch-terminal omarchy-speak-ui")
 
 -- Read the clipboard rather than the selection.
 o.bind("SUPER + ALT + R", "Speak clipboard", "omarchy-speak-ctl clipboard")
