@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Thin CLI over kokoro-onnx, shaped like piper's so both engines configure alike.
+"""Thin CLI over kokoro-onnx, shaped so the daemon can drive it as a template.
 
 Reads text on stdin. Streams raw int16 PCM to stdout with --output-raw, or
 writes a wav with --output-file. Streaming emits audio per sentence, so

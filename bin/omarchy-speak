@@ -2,7 +2,7 @@
 """omarchy-speak — a small local TTS daemon for Omarchy.
 
 Speaks the primary selection, the clipboard, or arbitrary text through a
-configurable engine (piper for speed, kokoro for quality). Clips can be queued
+configurable engine. Clips can be queued
 and played in turn, paused mid-word and resumed, or stepped through forwards
 and back. Exposes a tiny HTTP API on loopback so any client — Hyprland
 keybinds, a status-bar widget, a browser extension — can drive the same
@@ -38,7 +38,7 @@ CONFIG_PATH = Path(
 DEFAULT_CONFIG = {
     "host": "127.0.0.1",
     "port": 8765,
-    "default_engine": "piper",
+    "default_engine": "kokoro",
     "save_dir": "~/Audio/speak",
     # Profile -> voice. A caller sends {"profile": "claude"} and this decides
     # what that sounds like on this machine. Unlisted profiles use the engine's
@@ -52,25 +52,22 @@ DEFAULT_CONFIG = {
     # selection and nothing else.
     "selection_fallback": True,
     "max_chars": 20000,
+    # Engines are command templates, not built-in support, so adding one is a
+    # config change rather than a code change: name the binary, say how it
+    # streams, and list the placeholders it takes. Only kokoro ships configured;
+    # anything that can write raw PCM to stdout fits the same shape.
+    #
+    # mode "stream": the engine writes raw audio to stdout, piped straight to
+    # the player, so speech starts before synthesis ends. mode "file" renders a
+    # wav first and then plays it, for engines with no streaming path.
     "engines": {
-        # mode "stream": engine writes raw audio to stdout, piped straight to
-        # the player. Lowest latency — speech starts before synthesis ends.
-        "piper": {
-            "mode": "stream",
-            "speak": ["piper", "--model", "{model}", "--output-raw"],
-            "save": ["piper", "--model", "{model}", "--output-file", "{out}"],
-            "play": ["aplay", "-q", "-r", "22050", "-f", "S16_LE", "-t", "raw", "-"],
-            "model": "",
-        },
-        # mode "file": engine renders a wav, then we play it. Higher latency,
-        # but works with engines that have no streaming path.
         "kokoro": {
             "mode": "stream",
             "voice": "af_sarah",
             # No startup_grace override, because measurement says it needs none.
             # On the slowest machine here -- an i7-8550U with no CUDA -- kokoro
             # reaches first sample in 1.3s warm and 2.2s with its worker stopped
-            # entirely, against piper's 1.4-1.6s. The 30s default covers that
+            # entirely. The 30s default covers that
             # more than ten times over.
             #
             # Two earlier values, 120 and then 60, were invented rather than
@@ -128,8 +125,8 @@ STALL_CHARS_PER_SECOND = 4.0
 # playback -- it only delays noticing a broken engine.
 #
 # Measured, first sample arrives in 0.56s (kokoro on CUDA), 1.3s (kokoro warm,
-# i7-8550U, no CUDA), 2.2s (same, worker stopped) and 1.4-1.6s (piper, same
-# machine). A wedged worker, by contrast, blocked for over 180s at ~0% CPU. No
+# i7-8550U, no CUDA) and 2.2s (same machine, worker stopped outright). A
+# wedged worker, by contrast, blocked for over 180s at ~0% CPU. No
 # grace tells those apart, so size it for a slow machine's model load and stop:
 # every second beyond that is a second of a hung engine looking healthy.
 DEFAULT_STARTUP_GRACE = 30.0
@@ -323,7 +320,7 @@ class SelectionFallback:
 def render(template: list[str], **fields) -> list[str]:
     """Substitute {placeholders} and expand a leading ~ in the result.
 
-    Config files carry paths like ~/.local/share/piper/voices/x.onnx; the
+    Config files carry paths like ~/.local/share/kokoro/voices-v1.0.bin; the
     engine subprocess gets no shell, so the tilde must be expanded here.
     """
     parts = []
