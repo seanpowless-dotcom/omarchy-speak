@@ -63,12 +63,122 @@ DEFAULT_CONFIG = {
         "kokoro": {
             "mode": "stream",
             "voice": "af_sarah",
+            # No startup_grace override, because measurement says it needs none.
+            # On the slowest machine here -- an i7-8550U with no CUDA -- kokoro
+            # reaches first sample in 1.3s warm and 2.2s with its worker stopped
+            # entirely, against piper's 1.4-1.6s. The 30s default covers that
+            # more than ten times over.
+            #
+            # Two earlier values, 120 and then 60, were invented rather than
+            # measured, from a 30s reading that turned out to be a warm worker
+            # already wedged. They would have hidden a hung engine for a full
+            # minute on every request -- the precise failure this watchdog
+            # exists to catch.
             "speak": ["omarchy-speak-kokoro", "--voice", "{voice}", "--output-raw"],
             "save": ["omarchy-speak-kokoro", "--voice", "{voice}", "--output-file", "{out}"],
             "play": ["aplay", "-q", "-r", "24000", "-f", "S16_LE", "-t", "raw", "-"],
         },
     },
 }
+
+
+def log(msg: str) -> None:
+    """One line to stderr, which under systemd is the journal."""
+    print(f"omarchy-speak: {msg}", file=sys.stderr, flush=True)
+
+
+# Playback watchdog. Speech runs about 12-16 characters a second, so a clip
+# still sounding after several times its own length is not slow, it is stuck --
+# almost always on an audio sink that accepts data and never drains it. A
+# Bluetooth speaker that is connected but asleep looks exactly like this: BlueZ
+# reports the device connected, PipeWire keeps the node alive, short writes
+# vanish into the buffer and long ones block forever.
+#
+# Before this existed the watcher thread simply blocked in wait() for as long as
+# the sink stayed wedged. One observed hang ran 756 seconds on a single
+# paragraph, with /status reporting "speaking" the whole time and every
+# subsequent keypress appearing dead.
+#
+# The budget is deliberately loose -- roughly three times real speech -- so a
+# genuinely long article is never truncated. A 20,000 character read gets about
+# 84 minutes before the watchdog looks at it.
+STALL_CHARS_PER_SECOND = 4.0
+
+# The grace covers everything before the first sample: process spawn, model
+# load, and the engine's own warm-up. It is PER ENGINE because a model-loading
+# engine on a slow machine can take far longer to first sample than a streaming
+# one, and that says nothing about whether it is stuck.
+#
+# Resist the temptation to make it large. A long grace does not protect healthy
+# playback -- it only delays noticing a broken engine.
+#
+# Measured, first sample arrives in 0.56s (kokoro on CUDA), 1.3s (kokoro warm,
+# i7-8550U, no CUDA), 2.2s (same, worker stopped) and 1.4-1.6s (piper, same
+# machine). A wedged worker, by contrast, blocked for over 180s at ~0% CPU. No
+# grace tells those apart, so size it for a slow machine's model load and stop:
+# every second beyond that is a second of a hung engine looking healthy.
+DEFAULT_STARTUP_GRACE = 30.0
+
+
+def stall_budget(text: str, spec: dict) -> float:
+    """How long this clip may sound before it is presumed stuck.
+
+    Startup grace comes from the engine spec, because a model-loading engine on
+    a CPU is slow to first sample in a way that says nothing about whether it is
+    stuck.
+    """
+    try:
+        grace = float(spec.get("startup_grace", DEFAULT_STARTUP_GRACE))
+    except (TypeError, ValueError):
+        grace = DEFAULT_STARTUP_GRACE
+    return max(grace, 1.0) + len(text) / STALL_CHARS_PER_SECOND
+
+
+class ErrorTail:
+    """Keeps the last few KB of a child's stderr without letting it block.
+
+    A PIPE nobody reads fills at around 64K and the child blocks writing to it,
+    so the choice is between discarding stderr and draining it. Both the engine
+    and the player used DEVNULL, which meant a failure left nothing behind at
+    all: through an entire playback outage the journal held only the daemon's
+    own start and stop lines, and the cause had to be found by listing
+    processes by hand. Draining costs one thread per child and makes the
+    difference between a diagnosis and a guess.
+    """
+
+    LIMIT = 4000
+
+    def __init__(self, proc: subprocess.Popen, name: str) -> None:
+        self.name = name
+        self._buf = bytearray()
+        self._lock = threading.Lock()
+        if proc.stderr is not None:
+            threading.Thread(target=self._read, args=(proc.stderr,),
+                             daemon=True).start()
+
+    def _read(self, stream) -> None:
+        try:
+            for chunk in iter(lambda: stream.read(4096), b""):
+                with self._lock:
+                    self._buf.extend(chunk)
+                    if len(self._buf) > self.LIMIT:
+                        del self._buf[: -self.LIMIT]
+        except (OSError, ValueError):
+            pass
+        finally:
+            try:
+                stream.close()
+            except (OSError, ValueError):
+                pass
+
+    def text(self) -> str:
+        with self._lock:
+            return self._buf.decode("utf-8", "replace").strip()
+
+
+def describe_tails(tails: list) -> str:
+    parts = [f"{t.name}: {t.text()}" for t in tails if t.text()]
+    return " | ".join(parts)
 
 
 def sweep_scratch() -> int:
@@ -340,7 +450,7 @@ class Player:
         spec = clip.spec
         spawn = (self._spawn_stream if spec.get("mode", "stream") == "stream"
                  else self._spawn_file)
-        procs = spawn(clip.text, spec)
+        procs, tails = spawn(clip.text, spec)
 
         with self._lock:
             if gen != self._gen:  # superseded while we were synthesising
@@ -353,26 +463,80 @@ class Player:
             self._paused = False
             self._started = time.time()
             self._paused_for = 0.0
-        threading.Thread(target=self._watch, args=(gen, procs[-1]),
-                         daemon=True).start()
+        threading.Thread(
+            target=self._watch,
+            args=(gen, procs[-1], stall_budget(clip.text, spec), tails),
+            daemon=True,
+        ).start()
         return True
 
-    def _watch(self, gen: int, play: subprocess.Popen) -> None:
+    def _watch(self, gen: int, play: subprocess.Popen, budget: float,
+               tails: list[ErrorTail]) -> None:
         """Advance the queue when a clip ends of its own accord.
 
-        wait() does not return for a SIGSTOPped child, so a paused clip simply
-        parks this thread until it resumes or is torn down.
+        Polls rather than blocking in wait(), so a clip that never ends can be
+        cut loose instead of parking this thread for as long as the audio sink
+        stays wedged.
+
+        Paused time does not count against the budget. _elapsed() already
+        excludes it, and a SIGSTOPped child is *meant* to park here
+        indefinitely — pausing a clip over lunch must not look like a stall.
         """
-        play.wait()
+        while True:
+            try:
+                play.wait(timeout=1.0)
+                break
+            except subprocess.TimeoutExpired:
+                with self._lock:
+                    if gen != self._gen:
+                        return  # stopped, skipped or replaced — not ours any more
+                    if self._paused or self._elapsed() <= budget:
+                        continue
+                    overran = self._elapsed()
+                self._stalled(gen, overran, budget, tails)
+                return
+
         with self._lock:
             if gen != self._gen:
                 return  # stopped, skipped, or replaced — no longer ours to advance
+            # A player that died on its own says why, now that stderr is kept.
+            if play.returncode not in (0, None):
+                detail = describe_tails(tails)
+                log(f"player exited {play.returncode}"
+                    + (f": {detail}" if detail else " with no stderr"))
             nxt = self._index + 1
             if nxt >= len(self._queue):
                 self._procs = []
                 self._index = -1
+                # Drop the played clip. next() and prev() are both gated on
+                # _index, which is -1 from here, so a retained clip is
+                # unreachable — it only inflated "queued" in /status and left
+                # /queue listing something that had already finished.
+                self._queue = []
                 return
         self._play(nxt)
+
+    def _stalled(self, gen: int, elapsed: float, budget: float,
+                 tails: list[ErrorTail]) -> None:
+        """Kill a clip that has outlived any plausible duration, and say why.
+
+        The queue is dropped rather than advanced: whatever wedged this clip is
+        a property of the audio sink, not of the text, so the next clip would
+        almost certainly wedge in the same place.
+        """
+        with self._lock:
+            if gen != self._gen:
+                return
+            self._gen += 1
+            self._teardown()
+            self._queue = []
+            self._index = -1
+        detail = describe_tails(tails)
+        log(f"playback stalled after {elapsed:.0f}s (budget {budget:.0f}s) and was "
+            f"killed. The audio sink is accepting audio without draining it — a "
+            f"Bluetooth speaker that is connected but asleep does exactly this. "
+            f"Check `wpctl status` for the default sink."
+            + (f" Child stderr: {detail}" if detail else " No stderr from either child."))
 
     def speak(self, text: str, engine: str, spec: dict) -> None:
         """Replace the queue with this one clip and play it."""
@@ -439,17 +603,18 @@ class Player:
             self._paused = False
             return True
 
-    def _spawn_stream(self, text: str, spec: dict) -> list[subprocess.Popen]:
+    def _spawn_stream(self, text: str, spec: dict) -> tuple[list[subprocess.Popen], list[ErrorTail]]:
         tts_cmd = render(spec["speak"], **spec)
         play_cmd = render(spec["play"], **spec)
         tts = subprocess.Popen(
             tts_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
         )
         play = subprocess.Popen(
-            play_cmd, stdin=tts.stdout, stderr=subprocess.DEVNULL,
+            play_cmd, stdin=tts.stdout, stderr=subprocess.PIPE,
         )
         tts.stdout.close()  # let the player own the read end
+        tails = [ErrorTail(tts, tts_cmd[0]), ErrorTail(play, play_cmd[0])]
 
         def feed() -> None:
             try:
@@ -459,22 +624,33 @@ class Player:
                 pass
 
         threading.Thread(target=feed, daemon=True).start()
-        return [tts, play]
+        return [tts, play], tails
 
-    def _spawn_file(self, text: str, spec: dict) -> list[subprocess.Popen]:
+    def _spawn_file(self, text: str, spec: dict) -> tuple[list[subprocess.Popen], list[ErrorTail]]:
         tmp = SCRATCH / f"speak-{os.getpid()}-{int(time.time()*1000)}.wav"
         tmp.parent.mkdir(parents=True, exist_ok=True)
-        synth = subprocess.run(
-            render(spec["save"], out=str(tmp), **spec),
-            input=text.encode(), capture_output=True,
-        )
+        # Same budget as playback, for the same reason: an engine that never
+        # returns would otherwise park this thread forever. The watchdog only
+        # covers the player, so a synchronous synthesis needs its own bound.
+        budget = stall_budget(text, spec)
+        try:
+            synth = subprocess.run(
+                render(spec["save"], out=str(tmp), **spec),
+                input=text.encode(), capture_output=True, timeout=budget,
+            )
+        except subprocess.TimeoutExpired:
+            tmp.unlink(missing_ok=True)
+            raise RuntimeError(
+                f"synthesis timed out after {budget:.0f}s. Raise startup_grace for "
+                f"this engine if it is merely slow to load its model."
+            ) from None
         if synth.returncode != 0 or not tmp.exists():
             tmp.unlink(missing_ok=True)  # a failed run may still have written bytes
             err = synth.stderr.decode("utf-8", "replace")[:400]
             raise RuntimeError(f"synthesis failed: {err or 'no output produced'}")
-        play = subprocess.Popen(
-            render(spec["play"], out=str(tmp), **spec), stderr=subprocess.DEVNULL,
-        )
+        play_cmd = render(spec["play"], out=str(tmp), **spec)
+        play = subprocess.Popen(play_cmd, stderr=subprocess.PIPE)
+        tails = [ErrorTail(play, play_cmd[0])]
 
         self._tmp = tmp
 
@@ -483,7 +659,7 @@ class Player:
             tmp.unlink(missing_ok=True)
 
         threading.Thread(target=cleanup, daemon=True).start()
-        return [play]
+        return [play], tails
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -636,10 +812,21 @@ class Handler(BaseHTTPRequestHandler):
             out = Path(cfg["save_dir"]).expanduser() / f"speak-{stamp}.wav"
         out.parent.mkdir(parents=True, exist_ok=True)
 
-        result = subprocess.run(
-            render(spec["save"], out=str(out), **spec),
-            input=text.encode(), capture_output=True,
-        )
+        # /save renders without playing, so nothing is waiting to hear it and a
+        # slow engine is a fine trade -- but "slow" still has to end. A wedged
+        # engine here would hold this request open indefinitely.
+        budget = stall_budget(text, spec)
+        try:
+            result = subprocess.run(
+                render(spec["save"], out=str(out), **spec),
+                input=text.encode(), capture_output=True, timeout=budget,
+            )
+        except subprocess.TimeoutExpired:
+            out.unlink(missing_ok=True)
+            raise RuntimeError(
+                f"save timed out after {budget:.0f}s. Raise startup_grace for this "
+                f"engine if it is merely slow to load its model."
+            ) from None
         if result.returncode != 0 or not out.exists():
             err = result.stderr.decode("utf-8", "replace")[:400]
             raise RuntimeError(f"save failed: {err or 'no output produced'}")
