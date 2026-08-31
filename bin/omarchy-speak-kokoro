@@ -21,6 +21,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import socket
 import sys
 import threading
@@ -90,6 +91,61 @@ def build(model_name: str, voices_name: str, provider: str = "auto"):
         return Kokoro(str(model), str(voices))
 
 
+# The model's context is 510 phonemes. kokoro_onnx truncates to exactly that and
+# then indexes the voice array at len(tokens) -- index 510 of 510 -- so text over
+# the cap does not degrade, it raises IndexError inside an asyncio task whose
+# exception nobody retrieves. The utterance simply never arrives.
+#
+# Chunking below the cap avoids it entirely, and pays twice: the first chunk
+# starts playing while the rest is still being synthesised, which is what makes
+# long passages start promptly instead of after the whole text is rendered.
+#
+# 350 characters is deliberately conservative. English runs a little under one
+# phoneme per character, so the cap sits somewhere north of 500 characters, but
+# it moves with the text -- numbers, punctuation and stress marks all shift the
+# ratio -- and being wrong here is a silent failure rather than a slow one.
+MAX_CHUNK_CHARS = 350
+
+
+def chunk_text(text: str, limit: int = MAX_CHUNK_CHARS) -> list[str]:
+    """Split text into pieces that fit the model's phoneme window.
+
+    Splits on sentence boundaries so the seams fall where a reader would pause
+    anyway. A single sentence longer than the limit is broken at the last space
+    that fits, which is audible but rare and still better than losing it.
+    """
+    text = " ".join(text.split())
+    if not text:
+        return []
+    if len(text) <= limit:
+        return [text]
+
+    chunks: list[str] = []
+    current = ""
+    for sentence in re.split(r"(?<=[.!?])\s+", text):
+        while len(sentence) > limit:
+            cut = sentence.rfind(" ", 0, limit)
+            if cut <= 0:
+                cut = limit  # no space to break on; hard cut rather than fail
+            if current:
+                chunks.append(current)
+                current = ""
+            chunks.append(sentence[:cut].strip())
+            sentence = sentence[cut:].strip()
+        if not sentence:
+            continue
+        if not current:
+            current = sentence
+        elif len(current) + 1 + len(sentence) <= limit:
+            current += " " + sentence
+        else:
+            chunks.append(current)
+            current = sentence
+    if current:
+        chunks.append(current)
+    return chunks
+
+
 def to_pcm16(samples) -> bytes:
     import numpy as np
 
@@ -102,20 +158,28 @@ async def _stream(kokoro, req: dict, write) -> None:
     `write` raises BrokenPipeError once the consumer is gone, which is how an
     interrupted utterance stops the model mid-passage instead of finishing it.
     """
-    stream = kokoro.create_stream(
-        req["text"], voice=req["voice"], speed=req["speed"], lang=req["lang"]
-    )
-    async for samples, _rate in stream:
-        write(to_pcm16(samples))
+    for chunk in chunk_text(req["text"]):
+        stream = kokoro.create_stream(
+            chunk, voice=req["voice"], speed=req["speed"], lang=req["lang"]
+        )
+        async for samples, _rate in stream:
+            write(to_pcm16(samples))
 
 
 def synth_to_file(kokoro, req: dict) -> None:
     import soundfile as sf
 
-    samples, rate = kokoro.create(
-        req["text"], voice=req["voice"], speed=req["speed"], lang=req["lang"]
-    )
-    sf.write(req["output_file"], samples, rate)
+    import numpy as np
+
+    parts, rate = [], 24000
+    for chunk in chunk_text(req["text"]):
+        samples, rate = kokoro.create(
+            chunk, voice=req["voice"], speed=req["speed"], lang=req["lang"]
+        )
+        parts.append(samples)
+    if not parts:
+        raise ValueError("nothing to synthesise")
+    sf.write(req["output_file"], parts[0] if len(parts) == 1 else np.concatenate(parts), rate)
 
 
 # ── warm worker ──────────────────────────────────────────────────────────
