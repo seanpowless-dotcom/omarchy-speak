@@ -610,7 +610,16 @@ def main() -> int:
             app.meter.stop()
             app.audition.stop()
 
-    curses.wrapper(wrapped)
+    try:
+        curses.wrapper(wrapped)
+    except curses.error as exc:
+        # Most often "setupterm: could not find terminal", which means this was
+        # started somewhere without a terminal -- a non-interactive ssh command
+        # being the usual way. A traceback says none of that.
+        print(f"omarchy-speak-ui: needs a terminal ({exc}).\n"
+              f"TERM is {os.environ.get('TERM') or 'unset'}; run it from a "
+              f"terminal, or `ssh -t` if you are remote.")
+        return 1
     return 0
 
 
