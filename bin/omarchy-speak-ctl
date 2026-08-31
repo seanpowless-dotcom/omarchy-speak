@@ -49,6 +49,7 @@ omarchy-speak-ctl <command> [engine] [path]
   selection [engine]     speak the highlighted text (primary selection)
   clipboard [engine]     speak the clipboard
   say <text> [engine]    speak literal text
+  read [file] [engine]   read a .txt or .md file aloud, queued by section
   playpause [engine]     pause, resume, or start on the selection
   toggle [engine]        stop if speaking, else speak the selection
   next                   skip to the next clip in the queue
@@ -161,6 +162,110 @@ print(json.dumps(body))
     out=$(post /save "$body")
     saved=$(python3 -c 'import json,sys;print(json.load(sys.stdin)["path"])' <<<"$out")
     notify "Speak: saved" "$saved"
+    ;;
+  read)
+    # Read a document aloud. Markdown is stripped rather than spoken: raw .md
+    # reads as "hash hash Introduction, star star important star star", and code
+    # fences are worse -- nobody wants a shell script read to them.
+    #
+    # The file is split into sections and pushed as a QUEUE, not one clip. Three
+    # reasons: the daemon truncates any single utterance at max_chars, so a long
+    # document would silently lose its tail; playback starts on section one while
+    # the rest waits; and SUPER+[ / SUPER+] then step through the document
+    # instead of doing nothing.
+    doc="${2:-}"
+    if [[ -z "$doc" ]]; then
+      doc=$(omarchy-speak-picker --open "$HOME")
+      case $? in
+        1) exit 0 ;;   # cancelled -- not an error
+        2) echo "omarchy-speak-ctl: no file picker available; pass a path" >&2; exit 1 ;;
+      esac
+    fi
+    [[ -r "$doc" ]] || { notify "Speak: cannot read" "$doc"; exit 1; }
+
+    out=$(python3 - "$doc" "$BASE" "${3:-}" <<'PYREAD'
+import json, re, sys, urllib.request
+
+path, base, engine = sys.argv[1], sys.argv[2], sys.argv[3]
+raw = open(path, encoding="utf-8", errors="replace").read()
+
+def strip_markdown(text: str) -> str:
+    """Reduce Markdown to what a person would actually say out loud."""
+    # Fenced code first, before anything else can mangle the fences.
+    text = re.sub(r"```.*?```", " ", text, flags=re.S)
+    text = re.sub(r"~~~.*?~~~", " ", text, flags=re.S)
+    text = re.sub(r"<!--.*?-->", " ", text, flags=re.S)
+    # [ \t] rather than \s: \s matches newlines, so \s{4,} swallowed the
+    # blank lines before a paragraph and then the paragraph itself. That
+    # silently ate two lines of the first document this was tested on.
+    text = re.sub(r"^[ \t]{4,}\S.*$", " ", text, flags=re.M)      # indented code
+    text = re.sub(r"!\[[^\]]*\]\([^)]*\)", " ", text)            # images: drop
+    text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)         # links: keep text
+    text = re.sub(r"^\s*#{1,6}\s*", "", text, flags=re.M)         # headings
+    text = re.sub(r"^\s*>\s?", "", text, flags=re.M)              # blockquotes
+    text = re.sub(r"^\s*[-*_]{3,}\s*$", " ", text, flags=re.M)    # rules
+    text = re.sub(r"^\s*[-*+]\s+", "", text, flags=re.M)          # bullets
+    text = re.sub(r"^\s*\d+[.)]\s+", "", text, flags=re.M)        # numbered items
+    text = re.sub(r"`([^`]*)`", r"\1", text)                      # inline code
+    text = re.sub(r"(\*\*|__)(.*?)\1", r"\2", text, flags=re.S)    # bold
+    text = re.sub(r"(\*|_)(.*?)\1", r"\2", text, flags=re.S)       # italic
+    text = re.sub(r"^\s*\|.*\|\s*$", " ", text, flags=re.M)       # table rows
+    return text
+
+if path.lower().endswith((".md", ".markdown")):
+    raw = strip_markdown(raw)
+
+# Sections are navigation units, so they are far larger than the engine's own
+# internal chunking -- a SUPER+] that advanced 350 characters would be useless.
+LIMIT = 1800
+paras = [" ".join(p.split()) for p in re.split(r"\n\s*\n", raw)]
+paras = [p for p in paras if p]
+
+sections, cur = [], ""
+for para in paras:
+    while len(para) > LIMIT:                    # a single huge paragraph
+        cut = para.rfind(" ", 0, LIMIT)
+        if cut <= 0:
+            cut = LIMIT
+        if cur:
+            sections.append(cur); cur = ""
+        sections.append(para[:cut].strip())
+        para = para[cut:].strip()
+    if not para:
+        continue
+    if not cur:
+        cur = para
+    elif len(cur) + 1 + len(para) <= LIMIT:
+        cur += " " + para
+    else:
+        sections.append(cur); cur = para
+if cur:
+    sections.append(cur)
+
+if not sections:
+    print("nothing to read: the file has no speakable text", file=sys.stderr)
+    sys.exit(1)
+
+def post(endpoint, body):
+    req = urllib.request.Request(
+        base + endpoint, data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=300) as r:
+        return json.load(r)
+
+# First section replaces the queue and starts immediately; the rest queue behind
+# it, so audio begins before the whole document has finished posting.
+for i, section in enumerate(sections):
+    body = {"text": section}
+    if engine:
+        body["engine"] = engine
+    post("/speak" if i == 0 else "/queue", body)
+
+print("%d section(s), %d chars" % (len(sections), sum(len(x) for x in sections)))
+PYREAD
+    ) || { notify "Speak: could not read" "$(basename "$doc")"; exit 1; }
+    notify "Speak: reading $(basename "$doc")" "$out"
+    echo "$out"
     ;;
   status)
     curl -sS -m 5 "$BASE/status" | python3 -m json.tool 2>/dev/null \
