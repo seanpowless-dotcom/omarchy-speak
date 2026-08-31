@@ -51,6 +51,11 @@ LONG_FALLBACK = (
 
 CHUNK_MIN, CHUNK_MAX, CHUNK_STEP = 50, 500, 25
 
+# Rows per wheel notch. One is what every list in every other application does,
+# so it is the default; a high-resolution or free-spinning wheel may want more.
+# Set "ui": {"scroll_lines": N} in the config to change it.
+DEFAULT_SCROLL_LINES = 1
+
 
 def long_sample() -> str:
     for candidate in (Path.home() / "omarchy-speak/README.md",
@@ -278,6 +283,11 @@ class App:
         self.current = cfg.get("voice", "af_sarah")
         self.speed = float(cfg.get("speed", 1.0))
         self.chunk = int(cfg.get("chunk_chars", 350))
+        try:
+            self.scroll_lines = max(1, int(
+                read_config().get("ui", {}).get("scroll_lines", DEFAULT_SCROLL_LINES)))
+        except (TypeError, ValueError):
+            self.scroll_lines = DEFAULT_SCROLL_LINES
         self.saved = f"{self.current} @ {self.speed:.2f}"
         self.long_text = long_sample()
         self.has_reset = ctl_supports("reset")
@@ -287,6 +297,21 @@ class App:
         self.audition = Auditioner()
         if self.current in self.visible():
             self.voice_i = self.visible().index(self.current)
+
+    def log(self, message: str) -> None:
+        """Append to OMARCHY_SPEAK_UI_LOG, if set. Off unless asked for.
+
+        A curses app cannot print, so reproducing an input bug otherwise means
+        guessing. This records what the terminal actually delivered.
+        """
+        path = os.environ.get("OMARCHY_SPEAK_UI_LOG")
+        if not path:
+            return
+        try:
+            with open(path, "a") as fh:
+                fh.write(f"{time.monotonic():10.3f}  {message}\n")
+        except OSError:
+            pass
 
     def visible(self) -> list[str]:
         lang = self.langs[self.lang_i]
@@ -418,6 +443,9 @@ class App:
                 break
             if key == -1:
                 continue
+            if key != curses.KEY_MOUSE:
+                self.log(f"key={key} ({curses.keyname(key)!r}) "
+                         f"voice_i={self.voice_i} -> {self.selected()}")
             if key in (ord("q"), 27):
                 break
             elif key in (curses.KEY_DOWN, ord("j")):
@@ -460,10 +488,18 @@ class App:
                 self.status = "voices reloaded"
             elif key == curses.KEY_MOUSE:
                 try:
-                    _, mx, my, _, _ = curses.getmouse()
-                    self.click(my, mx)
+                    _, mx, my, _, bstate = curses.getmouse()
                 except curses.error:
-                    pass
+                    continue
+                self.log(f"mouse y={my} x={mx} state=0x{bstate:x} "
+                         f"top={self.top} voice_i={self.voice_i}")
+                if bstate & curses.BUTTON4_PRESSED:
+                    self.voice_i = max(0, self.voice_i - self.scroll_lines)
+                elif bstate & getattr(curses, "BUTTON5_PRESSED", 0):
+                    self.voice_i = min(self.voice_i + self.scroll_lines,
+                                       max(0, len(self.visible()) - 1))
+                else:
+                    self.click(my, mx)
 
     def save(self) -> None:
         """Persist the selection, then restart so the daemon picks it up.
@@ -511,7 +547,13 @@ def main() -> int:
     def wrapped(stdscr):
         curses.curs_set(0)
         try:
-            curses.mousemask(curses.BUTTON1_CLICKED | curses.BUTTON1_PRESSED)
+            # BUTTON1_CLICKED only. Registering PRESSED as well delivers TWO
+            # events for one physical click, which auditioned twice and made
+            # the selection appear to lag. Wheel buttons are named explicitly
+            # so scrolling scrolls instead of falling through to the click
+            # handler and auditioning whatever the pointer was resting on.
+            curses.mousemask(curses.BUTTON1_CLICKED
+                             | curses.BUTTON4_PRESSED | curses.BUTTON5_PRESSED)
         except curses.error:
             pass
         app = App(stdscr, voices)
