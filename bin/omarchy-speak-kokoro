@@ -158,7 +158,7 @@ async def _stream(kokoro, req: dict, write) -> None:
     `write` raises BrokenPipeError once the consumer is gone, which is how an
     interrupted utterance stops the model mid-passage instead of finishing it.
     """
-    for chunk in chunk_text(req["text"]):
+    for chunk in chunk_text(req["text"], req.get("chunk_chars") or MAX_CHUNK_CHARS):
         stream = kokoro.create_stream(
             chunk, voice=req["voice"], speed=req["speed"], lang=req["lang"]
         )
@@ -172,7 +172,7 @@ def synth_to_file(kokoro, req: dict) -> None:
     import numpy as np
 
     parts, rate = [], 24000
-    for chunk in chunk_text(req["text"]):
+    for chunk in chunk_text(req["text"], req.get("chunk_chars") or MAX_CHUNK_CHARS):
         samples, rate = kokoro.create(
             chunk, voice=req["voice"], speed=req["speed"], lang=req["lang"]
         )
@@ -277,6 +277,14 @@ def main() -> int:
     ap = argparse.ArgumentParser(prog="omarchy-speak-kokoro")
     ap.add_argument("-v", "--voice", default="af_sarah")
     ap.add_argument("-s", "--speed", type=float, default=1.0)
+    # Chunk size sets time-to-first-audio: the first chunk is the wait before
+    # any sound. Measured on a CPU-only i7-8550U, rendering costs roughly 1.2s
+    # fixed plus 30ms per character, so 350 characters is ~11s of silence there
+    # and 150 is ~4s. A machine with a GPU does not notice; a slow one does, and
+    # the right value is therefore a property of the machine, not of this file.
+    ap.add_argument("--chunk-chars", type=int, default=MAX_CHUNK_CHARS,
+                    dest="chunk_chars",
+                    help=f"characters per synthesis chunk (default {MAX_CHUNK_CHARS})")
     ap.add_argument("-l", "--lang", default="en-us")
     ap.add_argument("-f", "--output-file", "--output_file", dest="output_file")
     ap.add_argument("--output-raw", "--output_raw", action="store_true",
@@ -306,6 +314,7 @@ def main() -> int:
     req = {
         "text": text, "voice": args.voice, "speed": args.speed,
         "lang": args.lang, "output_file": args.output_file,
+        "chunk_chars": args.chunk_chars,
     }
 
     if try_worker(req):

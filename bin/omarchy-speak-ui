@@ -20,6 +20,7 @@ from __future__ import annotations
 import curses
 import json
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -39,6 +40,39 @@ CACHE = Path(os.environ.get("XDG_CACHE_HOME", "~/.cache")).expanduser() / "omarc
 VOICE_CACHE = CACHE / "voices.txt"
 
 SAMPLE = "The quick brown fox jumps over the lazy dog."
+
+# Chunk size is only observable on long text -- a single sentence is one chunk
+# whatever the setting -- so tuning it needs a passage. The project README if
+# one is to hand, since it is real prose with real paragraph structure;
+# otherwise something generated, so the key always does something.
+LONG_FALLBACK = (
+    "The quick brown fox jumps over the lazy dog while the daemon renders audio. "
+) * 8
+
+CHUNK_MIN, CHUNK_MAX, CHUNK_STEP = 50, 500, 25
+
+
+def long_sample() -> str:
+    for candidate in (Path.home() / "omarchy-speak/README.md",
+                      Path("/usr/share/doc/omarchy-speak/README.md")):
+        try:
+            text = candidate.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        # Light markdown strip. Not the full treatment `omarchy-speak-ctl read`
+        # gives a document -- this is a test tone, not a reader -- but enough
+        # that the sample does not audition as "hash omarchy dash speak, bracket
+        # Omarchy bracket paren h t t p s", which would demonstrate the bug
+        # rather than the voice.
+        text = re.sub(r"```.*?```", " ", text, flags=re.S)
+        text = re.sub(r"!\[[^\]]*\]\([^)]*\)", " ", text)
+        text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)
+        text = re.sub(r"[#*_`>|]", " ", text)
+        # Enough to exercise several chunks without reading the whole manual.
+        flat = " ".join(text.split())
+        if len(flat) > 400:
+            return flat[:2500]
+    return LONG_FALLBACK.strip()
 
 # Kokoro encodes language and gender in the voice name: first letter language,
 # second gender. Nothing else about a voice is knowable without hearing it,
@@ -190,6 +224,12 @@ class Auditioner:
     def __init__(self) -> None:
         self.procs: list[subprocess.Popen] = []
         self.error = ""
+        self.started: float | None = None
+        # Time to first SOUND, not to first byte out of the engine. Taken from
+        # the level meter, so it measures what actually reached the speakers --
+        # which is the number chunk size is being tuned against, and the one a
+        # dead sink correctly fails to produce.
+        self.first_sound: float | None = None
 
     def stop(self) -> None:
         for p in reversed(self.procs):
@@ -197,13 +237,15 @@ class Auditioner:
                 p.kill()
         self.procs = []
 
-    def play(self, voice: str, speed: float) -> None:
+    def play(self, voice: str, speed: float, chunk: int, text: str = SAMPLE) -> None:
         self.stop()
         self.error = ""
+        self.started = time.monotonic()
+        self.first_sound = None
         try:
             tts = subprocess.Popen(
                 ["omarchy-speak-kokoro", "--voice", voice, "--speed", f"{speed:.2f}",
-                 "--output-raw"],
+                 "--chunk-chars", str(chunk), "--output-raw"],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
             play = subprocess.Popen(
                 ["aplay", "-q", "-r", "24000", "-f", "S16_LE", "-t", "raw", "-"],
@@ -212,7 +254,7 @@ class Auditioner:
 
             def feed() -> None:
                 try:
-                    tts.stdin.write(SAMPLE.encode())
+                    tts.stdin.write(text.encode())
                     tts.stdin.close()
                 except (BrokenPipeError, ValueError):
                     pass
@@ -235,10 +277,12 @@ class App:
         cfg = read_config().get("engines", {}).get("kokoro", {})
         self.current = cfg.get("voice", "af_sarah")
         self.speed = float(cfg.get("speed", 1.0))
+        self.chunk = int(cfg.get("chunk_chars", 350))
         self.saved = f"{self.current} @ {self.speed:.2f}"
+        self.long_text = long_sample()
         self.has_reset = ctl_supports("reset")
-        self.status = ("enter audition   w save   r reset   q quit" if self.has_reset
-                       else "enter audition   w save   q quit")
+        self.status = ("enter/l audition   [ ] chunk   w save   r reset   q quit" if self.has_reset
+                       else "enter/l audition   [ ] chunk   w save   q quit")
         self.meter = Meter()
         self.audition = Auditioner()
         if self.current in self.visible():
@@ -305,10 +349,23 @@ class App:
             scr.addstr(3, dx, sel[: w - dx - 1], curses.A_BOLD)
             scr.addstr(4, dx, describe(sel)[: w - dx - 1], curses.A_DIM)
             scr.addstr(6, dx, f"speed  {self.speed:4.2f}   - / +"[: w - dx - 1])
+            scr.addstr(7, dx, f"chunk  {self.chunk:4d}   [ / ]"[: w - dx - 1])
+
+            # The number the chunk slider is tuned against. Measured from the
+            # level meter, so it is time to actual sound rather than to bytes
+            # leaving the engine -- and it stays blank if nothing was audible,
+            # which is the honest answer when the sink is swallowing audio.
+            first = self.audition.first_sound
+            if first is not None:
+                scr.addstr(8, dx, f"first sound  {int(first * 1000)} ms"[: w - dx - 1],
+                           curses.A_BOLD)
+            elif self.audition.started is not None and self.audition.procs:
+                scr.addstr(8, dx, "listening..."[: w - dx - 1], curses.A_DIM)
+
             if sel == self.current:
-                scr.addstr(8, dx, "this is the default"[: w - dx - 1], curses.A_DIM)
+                scr.addstr(10, dx, "this is the default"[: w - dx - 1], curses.A_DIM)
             if self.audition.error:
-                scr.addstr(10, dx, self.audition.error[: w - dx - 1])
+                scr.addstr(11, dx, self.audition.error[: w - dx - 1])
 
         # level meter
         self.draw_meter(h - 2, w)
@@ -341,11 +398,19 @@ class App:
             idx = self.top + (y - 3)
             if idx < len(self.visible()):
                 self.voice_i = idx
-                self.audition.play(self.selected(), self.speed)
+                self.audition.play(self.selected(), self.speed, self.chunk)
+
+    def note_first_sound(self) -> None:
+        """Record when audio first became audible after an audition started."""
+        a = self.audition
+        if (a.started is not None and a.first_sound is None
+                and self.meter.available and self.meter.level > 0.02):
+            a.first_sound = time.monotonic() - a.started
 
     def run(self) -> None:
         self.scr.timeout(100)  # also paces the meter redraw
         while True:
+            self.note_first_sound()
             self.draw()
             try:
                 key = self.scr.getch()
@@ -370,7 +435,16 @@ class App:
                 self.lang_i = (self.lang_i - 1) % len(self.langs)
                 self.voice_i = self.top = 0
             elif key in (ord("\n"), curses.KEY_ENTER, ord(" ")):
-                self.audition.play(self.selected(), self.speed)
+                self.audition.play(self.selected(), self.speed, self.chunk)
+            elif key == ord("l"):
+                # Long text, because chunk size is invisible on one sentence.
+                self.audition.play(self.selected(), self.speed, self.chunk,
+                                   self.long_text)
+                self.status = f"long sample ({len(self.long_text)} chars)"
+            elif key == ord("["):
+                self.chunk = max(CHUNK_MIN, self.chunk - CHUNK_STEP)
+            elif key == ord("]"):
+                self.chunk = min(CHUNK_MAX, self.chunk + CHUNK_STEP)
             elif key in (ord("+"), ord("=")):
                 self.speed = min(2.0, round(self.speed + 0.05, 2))
             elif key in (ord("-"), ord("_")):
@@ -402,6 +476,7 @@ class App:
             return
         write_engine_setting("voice", voice)
         write_engine_setting("speed", self.speed)
+        write_engine_setting("chunk_chars", self.chunk)
         self.current = voice
         self.saved = f"{voice} @ {self.speed:.2f}"
         self.status = "saved; restarting daemon..."
