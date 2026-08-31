@@ -3,8 +3,9 @@
 System-wide text-to-speech for [Omarchy](https://omarchy.org), driven by Hyprland keybinds.
 
 Highlight text anywhere — browser, terminal, PDF viewer, editor — and press a key to
-hear it. Two engines: **piper** for instant playback, **kokoro** when the voice matters
-more than the latency.
+hear it. Two engines: **piper** streams from a single binary with no model to
+load, **kokoro** sounds markedly better and needs onnxruntime and a model. Which
+is actually faster depends on the machine — measure before assuming.
 
 No browser extension. On Wayland the *primary selection* is system-wide, so one keybind
 covers every application at once — including terminal applications that never set a
@@ -26,7 +27,8 @@ selection, which fall back to the clipboard. See
   chunk size adjustable and a level meter that reads the output sink
 - **A voice per source** — an utterance can name a voice, or a profile the
   machine maps to one, so system, apps and agents can each sound different
-- **Two engines** — fast by default, high-quality on a modifier
+- **Two engines** — `default_engine` picks the one speaking uses; a request or
+  a keybind can name the other for one utterance
 - **GPU** — kokoro runs on CUDA when a usable GPU is present, and falls back to
   the CPU when it isn't
 - **Streaming** — both engines start speaking before synthesis finishes
@@ -185,18 +187,27 @@ Then add the keybindings. Omarchy configures Hyprland in Lua, so copy the
 (a packaged install puts the file at `/usr/share/omarchy-speak/speak.lua`):
 
 ```lua
-o.bind("SUPER + R", "Speak selection", "omarchy-speak-ctl toggle")
-o.bind("SUPER + SHIFT + R", "Speak selection (kokoro)", "omarchy-speak-ctl selection kokoro")
+o.bind("SUPER + R", "Speak selection (play/pause)", "omarchy-speak-ctl playpause")
+o.bind("SUPER + SHIFT + R", "Speak: voice picker", "omarchy-launch-terminal omarchy-speak-ui")
 o.bind("SUPER + ALT + R", "Speak clipboard", "omarchy-speak-ctl clipboard")
+o.bind("SUPER + SHIFT + BRACKETRIGHT", "Queue selection", "omarchy-speak-ctl enqueue")
+o.bind("SUPER + BRACKETRIGHT", "Speak: next in queue", "omarchy-speak-ctl next")
+o.bind("SUPER + BRACKETLEFT", "Speak: previous in queue", "omarchy-speak-ctl prev")
 o.bind("SUPER + SHIFT + ALT + R", "Save selection as audio", "omarchy-speak-ctl save kokoro")
 o.bind("SUPER + SHIFT + ESCAPE", "Stop speaking", "omarchy-speak-ctl stop")
 ```
+
+`save` names kokoro explicitly on purpose: nothing waits on a render to a file,
+so the artifact gets the better voice even on a machine where the faster engine
+is the default. Speaking does not name an engine, so it follows
+`default_engine`.
 
 Then `hyprctl reload`. On plain Hyprland without Omarchy's Lua layer, the
 equivalent `bindd =` lines go in `hyprland.conf`:
 
 ```
-bindd = SUPER, R, Speak selection, exec, omarchy-speak-ctl toggle
+bindd = SUPER, R, Speak selection, exec, omarchy-speak-ctl playpause
+bindd = SUPER SHIFT, R, Voice picker, exec, foot omarchy-speak-ui
 ```
 
 Check for conflicts before committing to keys — on Omarchy,
