@@ -9,7 +9,8 @@ mkdir -p "$BIN"
 install -Dm755 "$SRC/bin/omarchy-speak"        "$BIN/omarchy-speak"
 install -Dm755 "$SRC/bin/omarchy-speak-ctl"    "$BIN/omarchy-speak-ctl"
 install -Dm755 "$SRC/bin/omarchy-speak-picker" "$BIN/omarchy-speak-picker"
-echo "installed → $BIN/omarchy-speak{,-ctl,-picker}"
+install -Dm755 "$SRC/bin/omarchy-speak-ui"     "$BIN/omarchy-speak-ui"
+echo "installed → $BIN/omarchy-speak{,-ctl,-picker,-ui}"
 
 # kokoro-onnx is a pip package, so it usually lives in a venv rather than in
 # the system python. Point the wrapper at that venv if it exists; otherwise
@@ -20,6 +21,15 @@ install -Dm755 "$SRC/bin/omarchy-speak-kokoro" "$BIN/omarchy-speak-kokoro"
 if [[ -x "$KOKORO_VENV" ]]; then
   sed -i "1s|.*|#!$KOKORO_VENV|" "$BIN/omarchy-speak-kokoro"
   echo "kokoro wrapper pointed at $KOKORO_VENV"
+fi
+
+# Optional Omarchy bar module. Installing the script is harmless on its own --
+# it does nothing until an entry is added to shell.json -- so it goes in
+# whenever the directory it belongs to already exists.
+if [[ -d "$HOME/.config/omarchy" ]]; then
+  install -Dm755 "$SRC/omarchy/bar/scripts/speak-status" \
+    "$HOME/.config/omarchy/bar/scripts/speak-status"
+  echo "bar module installed → add it to shell.json; see omarchy/README.md"
 fi
 
 [[ -f "$HOME/.config/omarchy-speak/config.json" ]] \
