@@ -14,6 +14,7 @@ Stdlib only. No runtime dependencies beyond the TTS engines themselves.
 from __future__ import annotations
 
 import errno
+import ipaddress
 import json
 import os
 import shlex
@@ -38,6 +39,20 @@ CONFIG_PATH = Path(
 DEFAULT_CONFIG = {
     "host": "127.0.0.1",
     "port": 8765,
+    # Who may call. This machine (loopback) always may; nobody else may unless
+    # listed here, as addresses or networks: a mesh node ("100.101.102.103"),
+    # the whole tailnet ("100.64.0.0/10"), a LAN host. Listing a client does
+    # nothing while "host" is 127.0.0.1, because only this machine can reach
+    # a loopback socket in the first place. See "Who may call" in the README.
+    "allowed_clients": [],
+    # Extra names a client may put in the Host header, for a client that
+    # reaches the daemon by a hostname (e.g. "mohawk"). Loopback names and the
+    # bind address are always accepted.
+    "allowed_hosts": [],
+    # Browser origins allowed to call (e.g. a future extension's
+    # "chrome-extension://<id>"). Empty: every request from a web page is
+    # refused.
+    "allowed_origins": [],
     "default_engine": "kokoro",
     "save_dir": "~/Audio/speak",
     # Profile -> voice. A caller sends {"profile": "claude"} and this decides
@@ -686,9 +701,86 @@ class Player:
         return [play], tails
 
 
+LOOPBACK_NETS = (ipaddress.ip_network("127.0.0.0/8"), ipaddress.ip_network("::1/128"))
+LOOPBACK_NAMES = {"127.0.0.1", "localhost", "::1"}
+
+
+def allowed_nets(cfg: dict) -> list:
+    """Loopback plus every address or network in allowed_clients.
+
+    A malformed entry stops the daemon at startup rather than being skipped:
+    a skipped entry would silently lock out the node it was meant to admit,
+    and a typo here is far easier to find from a startup error.
+    """
+    nets = list(LOOPBACK_NETS)
+    for entry in cfg.get("allowed_clients", []):
+        nets.append(ipaddress.ip_network(entry, strict=False))
+    return nets
+
+
+def host_name(header: str) -> str:
+    """The name part of a Host header: "[::1]:8765" -> "::1", "a:1" -> "a"."""
+    header = header.strip().lower()
+    if header.startswith("["):
+        return header[1:header.find("]")] if "]" in header else header
+    if header.count(":") == 1:
+        return header.rsplit(":", 1)[0]
+    return header
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "omarchy-speak"
     protocol_version = "HTTP/1.1"
+
+    # -- who may call -----------------------------------------------------
+    # Three checks, because "it only listens on 127.0.0.1" stops the network
+    # but not the browser. Any web page open on this machine can send a
+    # request to a loopback address, and a plain-text POST needs no CORS
+    # preflight, so before these checks a page could make the daemon speak,
+    # read the clipboard aloud, or render a wav to any path.
+    #
+    # 1. Client address: loopback, or listed in allowed_clients. Never an
+    #    unknown machine, whatever "host" is bound to.
+    # 2. Host header: a loopback name, the bind address, or allowed_hosts.
+    #    A DNS-rebinding page reaches 127.0.0.1 under its own domain name,
+    #    which this refuses.
+    # 3. Origin header: absent (curl, scripts, the keybinds) or listed in
+    #    allowed_origins. Browsers attach Origin to every cross-origin POST.
+    # Plus, for a POST with a body, Content-Type must be application/json,
+    # which a page cannot send cross-origin without a preflight that this
+    # server never answers.
+    def _refuse(self, why: str) -> bool:
+        sys.stderr.write(f"refused {self.command} {self.path} from "
+                         f"{self.client_address[0]}: {why}\n")
+        # Close rather than read the body: an unread body left on a kept-alive
+        # connection would be parsed as the next request.
+        self.close_connection = True
+        self._send(403, {"error": f"refused: {why}"})
+        return True
+
+    def _refused(self) -> bool:
+        """True (and the 403 already sent) when this request may not proceed."""
+        addr = ipaddress.ip_address(self.client_address[0].split("%", 1)[0])
+        if getattr(addr, "ipv4_mapped", None):
+            addr = addr.ipv4_mapped
+        if not any(addr in net for net in self.server.allowed_nets):
+            return self._refuse("unknown client")
+
+        cfg = self.server.config
+        names = LOOPBACK_NAMES | {str(cfg["host"]).lower()} | {
+            h.lower() for h in cfg.get("allowed_hosts", [])}
+        if host_name(self.headers.get("Host", "")) not in names:
+            return self._refuse("unknown Host header")
+
+        origin = self.headers.get("Origin")
+        if origin is not None and origin not in cfg.get("allowed_origins", []):
+            return self._refuse("web page origin")
+
+        if self.command == "POST" and int(self.headers.get("Content-Length") or 0):
+            ctype = self.headers.get("Content-Type", "").split(";", 1)[0].strip()
+            if ctype.lower() != "application/json":
+                return self._refuse("body must be application/json")
+        return False
 
     # -- plumbing ---------------------------------------------------------
     def log_message(self, fmt, *args):  # quieter than the stdlib default
@@ -714,6 +806,8 @@ class Handler(BaseHTTPRequestHandler):
 
     # -- routes -----------------------------------------------------------
     def do_GET(self):
+        if self._refused():
+            return
         if self.path in ("/health", "/status"):
             self._send(200, {"ok": True, **self.server.player.status()})
         elif self.path == "/config":
@@ -736,6 +830,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, {"error": "not found"})
 
     def do_POST(self):
+        if self._refused():
+            return
         routes = {
             "/speak": self._speak,
             "/speak/selection": lambda b: self._speak(b, source="primary"),
@@ -878,6 +974,11 @@ class Handler(BaseHTTPRequestHandler):
         dest = body.get("path")
         if dest:
             out = Path(dest).expanduser()
+            # The picker lets you save anywhere, so the folder stays free; the
+            # suffix does not, so a bad path can never clobber a config, a key
+            # or a script with audio.
+            if out.suffix.lower() != ".wav":
+                raise RuntimeError(f"save path must end in .wav: {dest}")
         else:
             stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
             out = Path(cfg["save_dir"]).expanduser() / f"speak-{stamp}.wav"
@@ -987,6 +1088,12 @@ def main() -> int:
         return 1
     server.daemon_threads = True
     server.config = cfg
+    try:
+        server.allowed_nets = allowed_nets(cfg)
+    except ValueError as exc:
+        print(f"omarchy-speak: bad allowed_clients entry in {CONFIG_PATH}: {exc}",
+              file=sys.stderr)
+        return 1
     server.player = Player()
     server.selection = SelectionFallback(cfg.get("selection_fallback", True))
     server.verbose = "--verbose" in args or "-v" in args
