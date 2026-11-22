@@ -371,6 +371,10 @@ o.bind("SUPER + SHIFT + ALT + R", "Save selection as audio", "omarchy-speak-ctl 
 o.bind("SUPER + CTRL + ALT + S", "Save selection (no prompt)", "omarchy-speak-ctl save ~/Audio/speak/quick.wav")
 ```
 
+Whatever the folder, a save path must end in `.wav`; anything else is refused.
+That way no request, however it got here, can overwrite a config file, a key or
+a script with audio.
+
 The chooser is `omarchy-speak-picker`, a GTK4 `FileDialog` that routes through
 `xdg-desktop-portal` on Wayland, so it uses whatever file manager the desktop is
 configured for. If GTK bindings are missing it exits 2 and the save falls back
@@ -574,6 +578,9 @@ passage so you can hear the difference rather than guess at it.
 `voices` is a top-level map of profile to voice; see
 [A voice per source](#a-voice-per-source).
 
+`allowed_clients`, `allowed_hosts` and `allowed_origins` (all empty by default)
+decide who may call the daemon; see [Who may call](#who-may-call).
+
 ## HTTP API
 
 The daemon listens on `127.0.0.1:8765`. Any client can drive it — the keybinds are
@@ -627,6 +634,52 @@ exist quietly spoke whatever happened to be copied.
 
 Because it's plain HTTP, a status-bar widget or a browser extension can be added later
 without touching the daemon.
+
+### Who may call
+
+Only this machine, by default, and never a web page. Binding `127.0.0.1` keeps
+the network out, but not the browser: any page open on this machine can send a
+request to a loopback address, and a plain-text POST needs no CORS preflight.
+Before these checks, a page could make the daemon speak, read the clipboard
+aloud, or render a wav to any path. Every request now has to pass all of these,
+or gets `403` and a `refused …` line in the daemon's log:
+
+| Check | Passes when | Stops |
+| --- | --- | --- |
+| Client address | loopback, or listed in `allowed_clients` | any machine you have not named |
+| `Host` header | `127.0.0.1`, `localhost`, `::1`, the bind address, or listed in `allowed_hosts` | DNS rebinding (a page reaching 127.0.0.1 under its own domain) |
+| `Origin` header | absent, or listed in `allowed_origins` | web pages; browsers attach `Origin` to every cross-origin POST |
+| `Content-Type` (POST with a body) | `application/json` | a page's plain-text POST, sent without a preflight |
+
+`curl`, scripts and the keybinds send no `Origin` and already send JSON, so
+nothing local changes.
+
+**To reach it from another machine you own**, listen on every address and name
+both the machine and the address it dials. For example, over Tailscale:
+
+```json
+{
+  "host": "0.0.0.0",
+  "allowed_clients": ["100.79.12.34"],
+  "allowed_hosts": ["100.101.102.103", "mohawk"]
+}
+```
+
+`allowed_clients` is the calling machine; `allowed_hosts` is how that machine
+addresses this one (its Tailscale address, or a name such as `mohawk`). The
+example values are placeholders; `tailscale ip -4` prints a node's address.
+`allowed_clients` takes single addresses or networks (`"100.64.0.0/10"` is the
+whole tailnet; prefer naming nodes). Listening on every address keeps the
+keybinds working, since they call `127.0.0.1`; binding only the Tailscale
+address would shut them out. Every unnamed machine is still refused, and the
+host firewall should allow the port only from the same nodes, so two locks
+have to agree.
+
+A malformed entry stops the daemon at startup instead of being skipped,
+because a skipped entry would silently lock out the node it was meant to admit.
+There is no password: the requirement is a known address on a network you
+control, and a mesh such as Tailscale is what makes an address mean "a known
+node".
 
 ## Why loopback HTTP and not a native messaging host
 
